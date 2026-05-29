@@ -789,6 +789,163 @@ def send_message(recipient: str, message: str) -> tuple[bool, str]:
         return False, f"Unexpected error: {str(e)}"
 
 
+def _post_bridge(path: str, payload: dict) -> tuple[bool, str, dict]:
+    """Helper: POST a JSON payload to the bridge REST API and return (success, message, full_json)."""
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}{path}"
+        response = requests.post(url, json=payload)
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", ""), result
+        return False, f"HTTP {response.status_code}: {response.text}", {}
+    except requests.RequestException as e:
+        return False, f"Request error: {e}", {}
+    except json.JSONDecodeError:
+        return False, "Error parsing response", {}
+    except Exception as e:
+        return False, f"Unexpected error: {e}", {}
+
+
+def reply_to_message(
+    recipient: str, message: str, reply_to_message_id: str, reply_to_sender: str = ""
+) -> tuple[bool, str]:
+    ok, msg, _ = _post_bridge(
+        "/reply",
+        {
+            "recipient": recipient,
+            "message": message,
+            "reply_to_message_id": reply_to_message_id,
+            "reply_to_sender": reply_to_sender,
+        },
+    )
+    return ok, msg
+
+
+def forward_message(recipient: str, message_id: str, source_chat_jid: str) -> tuple[bool, str]:
+    ok, msg, _ = _post_bridge(
+        "/forward",
+        {"recipient": recipient, "message_id": message_id, "source_chat_jid": source_chat_jid},
+    )
+    return ok, msg
+
+
+def edit_message(recipient: str, message_id: str, new_message: str) -> tuple[bool, str]:
+    ok, msg, _ = _post_bridge(
+        "/edit", {"recipient": recipient, "message_id": message_id, "new_message": new_message}
+    )
+    return ok, msg
+
+
+def revoke_message(
+    recipient: str, message_id: str, sender: str = ""
+) -> tuple[bool, str]:
+    ok, msg, _ = _post_bridge(
+        "/revoke", {"recipient": recipient, "message_id": message_id, "sender": sender}
+    )
+    return ok, msg
+
+
+def mark_messages_read(
+    chat_jid: str, message_ids: list[str], sender_jid: str = "", receipt_type: str = "read"
+) -> tuple[bool, str]:
+    ok, msg, _ = _post_bridge(
+        "/read",
+        {
+            "chat_jid": chat_jid,
+            "sender_jid": sender_jid,
+            "message_ids": message_ids,
+            "receipt_type": receipt_type,
+        },
+    )
+    return ok, msg
+
+
+def mark_chat_read(chat_jid: str) -> tuple[bool, str]:
+    ok, msg, _ = _post_bridge("/chat_read", {"chat_jid": chat_jid})
+    return ok, msg
+
+
+def get_group_info(group_jid: str) -> dict:
+    _, _, full = _post_bridge("/group/info", {"group_jid": group_jid})
+    return full
+
+
+def update_group_participants(
+    group_jid: str, action: str, jids: list[str]
+) -> tuple[bool, str, list]:
+    ok, msg, full = _post_bridge(
+        "/group/participants", {"group_jid": group_jid, "action": action, "jids": jids}
+    )
+    return ok, msg, full.get("participants", [])
+
+
+def send_location(
+    recipient: str, latitude: float, longitude: float, name: str = "", address: str = ""
+) -> tuple[bool, str]:
+    ok, msg, _ = _post_bridge(
+        "/location",
+        {
+            "recipient": recipient,
+            "latitude": latitude,
+            "longitude": longitude,
+            "name": name,
+            "address": address,
+        },
+    )
+    return ok, msg
+
+
+def send_sticker(recipient: str, sticker_path: str) -> tuple[bool, str]:
+    ok, msg, _ = _post_bridge(
+        "/sticker", {"recipient": recipient, "sticker_path": sticker_path}
+    )
+    return ok, msg
+
+
+def list_recent_calls(limit: int = 50, after: str = "") -> dict:
+    _, _, full = _post_bridge("/calls/recent", {"limit": limit, "after": after})
+    return full
+
+
+def react_to_message(
+    recipient: str, message_id: str, emoji: str, from_me: bool = True
+) -> tuple[bool, str]:
+    """Send an emoji reaction to an existing WhatsApp message.
+
+    Args:
+        recipient: Phone number (no +) or full JID of the chat the message is in.
+        message_id: The ID of the message to react to.
+        emoji: The reaction emoji (e.g. "👍"). Pass an empty string to remove a prior reaction.
+        from_me: True if the original message was sent by this account (i.e. you sent it).
+                 False if the original message was received from someone else.
+    """
+    try:
+        if not recipient:
+            return False, "Recipient must be provided"
+        if not message_id:
+            return False, "message_id must be provided"
+
+        url = f"{WHATSAPP_API_BASE_URL}/react"
+        payload = {
+            "recipient": recipient,
+            "message_id": message_id,
+            "emoji": emoji,
+            "from_me": from_me,
+        }
+        response = requests.post(url, json=payload)
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+
 def send_file(recipient: str, media_path: str) -> tuple[bool, str]:
     try:
         # Validate input
@@ -897,3 +1054,377 @@ def download_media(message_id: str, chat_jid: str) -> str | None:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+
+# ─── Full-text search via SQLite FTS5 ──────────────────────────────────────
+# A virtual FTS5 table (`messages_fts`) is created once on demand and kept in
+# sync with `messages` via three triggers (insert / update / delete). The
+# first call to `ensure_fts_indexes` backfills the FTS table from any existing
+# rows. Subsequent calls are no-ops.
+_FTS_READY = False
+
+
+def ensure_fts_indexes(conn: sqlite3.Connection) -> None:
+    """Idempotent — sets up the FTS5 virtual table + triggers + backfill.
+
+    `messages_fts` mirrors `messages` on three columns the user is likely to
+    search by: content, chat_jid, sender. Rowid is keyed to the (id, chat_jid)
+    pair via a synthetic uuid stored in messages.
+    """
+    global _FTS_READY
+    if _FTS_READY:
+        return
+    cur = conn.cursor()
+
+    # Check if FTS table already exists
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='messages_fts'")
+    if cur.fetchone() is None:
+        # Create the FTS5 virtual table — content-less, references messages rowid.
+        cur.execute("""
+            CREATE VIRTUAL TABLE messages_fts USING fts5(
+                content, sender, chat_jid,
+                content='messages',
+                content_rowid='rowid',
+                tokenize='unicode61 remove_diacritics 2'
+            )
+        """)
+        # Triggers to keep FTS in sync with the messages table.
+        cur.execute("""
+            CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+              INSERT INTO messages_fts(rowid, content, sender, chat_jid)
+              VALUES (new.rowid, new.content, new.sender, new.chat_jid);
+            END
+        """)
+        cur.execute("""
+            CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+              INSERT INTO messages_fts(messages_fts, rowid, content, sender, chat_jid)
+              VALUES('delete', old.rowid, old.content, old.sender, old.chat_jid);
+            END
+        """)
+        cur.execute("""
+            CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+              INSERT INTO messages_fts(messages_fts, rowid, content, sender, chat_jid)
+              VALUES('delete', old.rowid, old.content, old.sender, old.chat_jid);
+              INSERT INTO messages_fts(rowid, content, sender, chat_jid)
+              VALUES (new.rowid, new.content, new.sender, new.chat_jid);
+            END
+        """)
+        # Backfill from existing rows. Single statement, atomic.
+        cur.execute("""
+            INSERT INTO messages_fts(rowid, content, sender, chat_jid)
+            SELECT rowid, content, sender, chat_jid FROM messages
+        """)
+        conn.commit()
+    _FTS_READY = True
+
+
+def search_messages(
+    query: str,
+    chat_jid: str | None = None,
+    after: str | None = None,
+    before: str | None = None,
+    limit: int = 30,
+) -> list[dict[str, Any]]:
+    """Full-text search messages using SQLite FTS5. Sub-second across the
+    whole DB. Supports FTS5 syntax: phrase queries ("aws cost"), prefix
+    (sage*), boolean (aws AND credit), NEAR (NEAR(aws credit, 10)).
+
+    Args:
+        query: FTS5 query string (plain words OK; advanced syntax supported)
+        chat_jid: Optional — restrict to a single chat
+        after, before: Optional ISO-8601 timestamps to bound the time window
+        limit: max rows to return
+
+    Returns:
+        List of message dicts ordered by FTS relevance (bm25), most relevant first.
+    """
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        ensure_fts_indexes(conn)
+        cur = conn.cursor()
+
+        where = ["messages_fts MATCH ?"]
+        params: list[Any] = [query]
+        if chat_jid:
+            where.append("m.chat_jid = ?")
+            params.append(chat_jid)
+        if after:
+            where.append("m.timestamp >= ?")
+            params.append(after)
+        if before:
+            where.append("m.timestamp <= ?")
+            params.append(before)
+
+        sql = f"""
+            SELECT m.id, m.chat_jid, m.sender, m.content, m.timestamp,
+                   m.is_from_me, m.media_type, m.filename,
+                   c.name AS chat_name,
+                   bm25(messages_fts) AS rank
+              FROM messages_fts
+              JOIN messages m ON m.rowid = messages_fts.rowid
+              LEFT JOIN chats c ON c.jid = m.chat_jid
+             WHERE {' AND '.join(where)}
+             ORDER BY rank
+             LIMIT ?
+        """
+        params.append(limit)
+        cur.execute(sql, params)
+        out: list[dict[str, Any]] = []
+        for row in cur.fetchall():
+            d = dict(row)
+            d["timestamp"] = str(d["timestamp"])
+            out.append(d)
+        return out
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ─── Catch-up summary ──────────────────────────────────────────────────────
+def catch_up(
+    hours: int = 12,
+    awaiting_my_reply: bool = False,
+    include_groups: bool = True,
+    include_dms: bool = True,
+    limit_chats: int = 30,
+) -> dict[str, Any]:
+    """Roll up activity across all chats in the last N hours.
+
+    Returns a per-chat summary: chat name, JID, message count, unique senders,
+    last message preview. Sorted by recency. Designed for triage — pair it
+    with list_messages on chats you want to drill into.
+
+    Args:
+        hours: Lookback window (default 12)
+        awaiting_my_reply: If True, only show chats where the last message
+                           wasn't from me — i.e., still waiting for my reply.
+                           WhatsApp's actual read state isn't stored in this
+                           DB, so this is the closest available semantic
+                           (`last_message.is_from_me = 0`).
+        include_groups: Include @g.us JIDs
+        include_dms: Include @s.whatsapp.net / @lid 1:1 JIDs
+        limit_chats: Cap the chat list (newest activity first)
+
+    Returns:
+        {window_hours, since, total_chats, total_messages, chats: [...]}
+        On error: same shape with `chats: []` and an `error` key.
+    """
+    from datetime import datetime, timedelta, timezone
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = None
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        chat_clauses = []
+        if include_groups: chat_clauses.append("chat_jid LIKE '%@g.us'")
+        if include_dms:    chat_clauses.append("chat_jid LIKE '%@s.whatsapp.net' OR chat_jid LIKE '%@lid'")
+        chat_filter = "(" + " OR ".join(chat_clauses) + ")" if chat_clauses else "1=1"
+        awaiting_filter = "AND l.is_from_me = 0" if awaiting_my_reply else ""
+
+        # Single-query catch_up. chat_activity aggregates per-chat stats over
+        # the window; last_msg picks the most recent message per chat via
+        # ROW_NUMBER. Pushing awaiting_my_reply into SQL avoids fetching +
+        # serialising rows we'd otherwise discard — fewer queries, smaller
+        # MCP stdio payload.
+        cur.execute(f"""
+            WITH chat_activity AS (
+                SELECT m.chat_jid,
+                       COUNT(*) AS message_count,
+                       COUNT(DISTINCT m.sender) AS unique_senders,
+                       MAX(m.timestamp) AS last_ts,
+                       SUM(CASE WHEN m.is_from_me=1 THEN 1 ELSE 0 END) AS my_messages
+                  FROM messages m
+                 WHERE m.timestamp >= ?
+                   AND {chat_filter}
+                 GROUP BY m.chat_jid
+            ),
+            last_msg AS (
+                SELECT chat_jid, sender, content, is_from_me, timestamp,
+                       ROW_NUMBER() OVER (PARTITION BY chat_jid ORDER BY timestamp DESC) AS rn
+                  FROM messages
+                 WHERE chat_jid IN (SELECT chat_jid FROM chat_activity)
+            )
+            SELECT a.chat_jid,
+                   c.name AS chat_name,
+                   a.message_count,
+                   a.unique_senders,
+                   a.last_ts,
+                   a.my_messages,
+                   l.sender AS last_sender,
+                   substr(l.content, 1, 100) AS last_preview,
+                   l.is_from_me AS last_is_from_me,
+                   l.timestamp AS last_timestamp
+              FROM chat_activity a
+              LEFT JOIN chats c ON c.jid = a.chat_jid
+              LEFT JOIN last_msg l ON l.chat_jid = a.chat_jid AND l.rn = 1
+             WHERE 1=1 {awaiting_filter}
+             ORDER BY a.last_ts DESC
+             LIMIT ?
+        """, (cutoff, limit_chats))
+
+        rows = []
+        for r in cur.fetchall():
+            row = {
+                "chat_jid": r["chat_jid"],
+                "chat_name": r["chat_name"],
+                "message_count": r["message_count"],
+                "unique_senders": r["unique_senders"],
+                "last_ts": r["last_ts"],
+                "my_messages": r["my_messages"],
+            }
+            if r["last_sender"] is not None:
+                row["last_message"] = {
+                    "sender": r["last_sender"],
+                    "preview": r["last_preview"],
+                    "is_from_me": r["last_is_from_me"],
+                    "timestamp": r["last_timestamp"],
+                }
+            rows.append(row)
+
+        total_msgs = sum(r["message_count"] for r in rows)
+        return {
+            "window_hours": hours,
+            "since": cutoff + "Z",
+            "total_chats": len(rows),
+            "total_messages": total_msgs,
+            "chats": rows,
+        }
+    except Exception as e:
+        print(f"Database error in catch_up: {e}")
+        return {
+            "window_hours": hours,
+            "since": cutoff + "Z",
+            "total_chats": 0,
+            "total_messages": 0,
+            "chats": [],
+            "error": str(e),
+        }
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+# ─── Voice transcription ───────────────────────────────────────────────────
+def transcribe_audio(
+    message_id: str,
+    chat_jid: str,
+    provider: str | None = None,
+    language: str = "en",
+) -> dict[str, Any]:
+    """Download a voice/audio message and transcribe it.
+
+    Provider resolution (env-driven; first non-empty wins):
+      - explicit `provider` arg → 'openai' | 'sarvam'
+      - WHATSAPP_TRANSCRIBE_PROVIDER env
+      - OPENAI_API_KEY set → openai
+      - SARVAM_API_KEY set → sarvam
+      - else: error with guidance
+
+    Args:
+        message_id, chat_jid: identify the voice message to fetch
+        provider: 'openai' or 'sarvam' (optional override)
+        language: ISO code; 'en' default; 'hi-IN' for Hindi via Sarvam
+
+    Returns:
+        {'success': bool, 'text': str, 'provider': str, 'audio_path': str, ...}
+    """
+    if not provider:
+        provider = os.getenv("WHATSAPP_TRANSCRIBE_PROVIDER")
+    if not provider:
+        if os.getenv("OPENAI_API_KEY"):
+            provider = "openai"
+        elif os.getenv("SARVAM_API_KEY"):
+            provider = "sarvam"
+        else:
+            return {
+                "success": False,
+                "error": "no transcription provider configured. Set OPENAI_API_KEY or SARVAM_API_KEY, or pass provider='openai'/'sarvam'",
+            }
+
+    audio_path = download_media(message_id, chat_jid)
+    if not audio_path or not os.path.isfile(audio_path):
+        return {"success": False, "error": f"could not download media for {message_id}"}
+
+    try:
+        if provider == "openai":
+            return _transcribe_openai(audio_path, language)
+        elif provider == "sarvam":
+            return _transcribe_sarvam(audio_path, language)
+        else:
+            return {"success": False, "error": f"unknown provider '{provider}'"}
+    except Exception as e:
+        return {"success": False, "error": f"transcription failed: {e}", "audio_path": audio_path, "provider": provider}
+
+
+def _transcribe_openai(audio_path: str, language: str) -> dict[str, Any]:
+    """Use OpenAI Whisper API. Cheap (~$0.006/min) and reliable for Indic+EN."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {"success": False, "error": "OPENAI_API_KEY not set"}
+    with open(audio_path, "rb") as f:
+        resp = requests.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            files={"file": (os.path.basename(audio_path), f, "audio/ogg")},
+            data={"model": "whisper-1", "language": language[:2]},
+            timeout=120,
+        )
+    if resp.status_code != 200:
+        return {"success": False, "error": f"openai whisper {resp.status_code}: {resp.text[:200]}", "audio_path": audio_path}
+    data = resp.json()
+    return {"success": True, "text": data.get("text", ""), "provider": "openai-whisper", "audio_path": audio_path}
+
+
+def _transcribe_sarvam(audio_path: str, language: str) -> dict[str, Any]:
+    """Use Sarvam's saarika ASR (better for Hindi / Indic languages, including
+    Hinglish code-switched audio. KC already pays Sarvam — no extra vendor)."""
+    api_key = os.getenv("SARVAM_API_KEY")
+    if not api_key:
+        return {"success": False, "error": "SARVAM_API_KEY not set"}
+    # Sarvam expects 'hi-IN', 'en-IN', etc. Default unknown lang to en-IN.
+    lang_code = language if "-" in language else f"{language}-IN"
+    with open(audio_path, "rb") as f:
+        resp = requests.post(
+            "https://api.sarvam.ai/speech-to-text",
+            headers={"api-subscription-key": api_key},
+            files={"file": (os.path.basename(audio_path), f, "audio/ogg")},
+            data={"language_code": lang_code, "model": "saarika:v2.5"},
+            timeout=120,
+        )
+    if resp.status_code != 200:
+        return {"success": False, "error": f"sarvam {resp.status_code}: {resp.text[:200]}", "audio_path": audio_path}
+    data = resp.json()
+    return {"success": True, "text": data.get("transcript", ""), "provider": "sarvam-saarika:v2.5", "audio_path": audio_path}
+
+
+# ─── History sync request (bridge passthrough) ─────────────────────────────
+def request_history(chat_jid: str, count: int = 100) -> dict[str, Any]:
+    """Ask the WhatsApp server for older messages in a chat. Newly delivered
+    messages arrive via the bridge's HistorySync event handler and land in
+    the local DB; this call just kicks off the request — poll list_messages
+    a few seconds later to see them.
+
+    Args:
+        chat_jid: e.g. '120363420428178043@g.us'
+        count: how many older messages to fetch (default 100, max 500)
+
+    Returns:
+        {'success': bool, 'message': str}
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/history_sync"
+        resp = requests.post(url, json={"chat_jid": chat_jid, "count": min(max(1, count), 500)}, timeout=30)
+        return resp.json() if resp.status_code == 200 else {
+            "success": False,
+            "message": f"bridge returned {resp.status_code}: {resp.text[:200]}",
+        }
+    except requests.exceptions.RequestException as e:
+        return {"success": False, "message": f"bridge call failed: {e}"}

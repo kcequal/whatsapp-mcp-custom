@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -105,6 +106,17 @@ func NewMessageStore() (*MessageStore, error) {
 			file_length INTEGER,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
+		);
+
+		CREATE TABLE IF NOT EXISTS calls (
+			call_id TEXT,
+			caller_jid TEXT,
+			from_jid TEXT,
+			event_type TEXT,
+			media TEXT,
+			is_group BOOLEAN,
+			timestamp TIMESTAMP,
+			PRIMARY KEY (call_id, event_type)
 		);
 	`)
 	if err != nil {
@@ -377,6 +389,17 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 	return err
 }
 
+// GetOldestMessage returns the earliest known message in a chat — used as
+// the anchor for /api/history_sync (whatsmeow's BuildHistorySyncRequest
+// needs the oldest known message; the server then returns N older than that).
+func (store *MessageStore) GetOldestMessage(chatJID string) (id, sender string, isFromMe bool, ts time.Time, err error) {
+	err = store.db.QueryRow(
+		"SELECT id, sender, is_from_me, timestamp FROM messages WHERE chat_jid=? ORDER BY timestamp ASC LIMIT 1",
+		chatJID,
+	).Scan(&id, &sender, &isFromMe, &ts)
+	return
+}
+
 // Get messages from a chat
 func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, error) {
 	rows, err := store.db.Query(
@@ -403,6 +426,21 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 	return messages, nil
 }
 
+// logCallEvent persists a single WhatsApp call event into the local store.
+// Called from the AddEventHandler closure for *events.CallOffer / *events.CallAccept / etc.
+func logCallEvent(store *MessageStore, callID, callerJID, fromJID, eventType, media string, isGroup bool) {
+	if store == nil || callID == "" {
+		return
+	}
+	_, err := store.db.Exec(
+		"INSERT OR REPLACE INTO calls (call_id, caller_jid, from_jid, event_type, media, is_group, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		callID, callerJID, fromJID, eventType, media, isGroup, time.Now(),
+	)
+	if err != nil {
+		fmt.Printf("logCallEvent: failed to insert call %s/%s: %v\n", callID, eventType, err)
+	}
+}
+
 // Get all chats
 func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	rows, err := store.db.Query("SELECT jid, last_message_time FROM chats ORDER BY last_message_time DESC")
@@ -423,6 +461,32 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	}
 
 	return chats, nil
+}
+
+// Match @<digits> mention tokens in message text. Group members in WhatsApp
+// are addressed by LID (linked identifier) — a long numeric string. Mentions
+// only render as a clickable tag when the JID is ALSO present in the
+// ContextInfo.MentionedJid array; just typing @<lid> in text shows raw.
+var mentionRe = regexp.MustCompile(`@(\d{6,})`)
+
+// extractMentions returns the @<digits> mentions in `text` as fully-qualified
+// LID JIDs. Empty slice if no mentions found. Caller assigns the result to
+// ContextInfo.MentionedJid so receiving clients render clickable tags.
+func extractMentions(text string) []string {
+	matches := mentionRe.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(matches))
+	seen := make(map[string]bool, len(matches))
+	for _, m := range matches {
+		jid := m[1] + "@lid"
+		if !seen[jid] {
+			seen[jid] = true
+			out = append(out, jid)
+		}
+	}
+	return out
 }
 
 // Extract text content from a message
@@ -553,6 +617,41 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			mediaType = whatsmeow.MediaVideo
 			mimeType = "video/quicktime"
 
+		// Document types — set explicit MIME so receivers preview correctly
+		case "pdf":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/pdf"
+		case "docx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+		case "doc":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/msword"
+		case "xlsx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+		case "xls":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.ms-excel"
+		case "pptx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+		case "ppt":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.ms-powerpoint"
+		case "txt":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "text/plain"
+		case "csv":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "text/csv"
+		case "md":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "text/markdown"
+		case "json":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/json"
+
 		// Document types (for any other file type)
 		default:
 			mediaType = whatsmeow.MediaDocument
@@ -622,8 +721,10 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileLength:    &resp.FileLength,
 			}
 		case whatsmeow.MediaDocument:
+			docFileName := mediaPath[strings.LastIndex(mediaPath, "/")+1:]
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				FileName:      proto.String(docFileName),
+				Title:         proto.String(docFileName),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -635,7 +736,20 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			}
 		}
 	} else {
-		msg.Conversation = proto.String(message)
+		// If the text contains @<lid> mentions, send as ExtendedTextMessage
+		// with MentionedJid populated so receiving clients render clickable
+		// tags. Without this, the @-tag shows as raw text. Plain Conversation
+		// has no field for mentions.
+		if mentions := extractMentions(message); len(mentions) > 0 {
+			msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
+				Text: proto.String(message),
+				ContextInfo: &waProto.ContextInfo{
+					MentionedJID: mentions,
+				},
+			}
+		} else {
+			msg.Conversation = proto.String(message)
+		}
 	}
 
 	// Send message
@@ -840,6 +954,13 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileEncSHA256,
 		fileLength,
 	)
+
+	// Auto-download media to disk if AUTO_DOWNLOAD_MEDIA=true. Saves the
+	// API-roundtrip when the agent later wants the file. Skips own-sent
+	// messages by default (those usually originated locally anyway).
+	if mediaType != "" && os.Getenv("AUTO_DOWNLOAD_MEDIA") == "true" && !msg.Info.IsFromMe {
+		go autoDownloadMedia(client, messageStore, msg, chatJID, mediaType, filename, logger)
+	}
 
 	// Send webhook for incoming messages
 	// Forward self-messages when FORWARD_SELF=true
@@ -1061,6 +1182,23 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
 	return true, mediaType, filename, absPath, nil
+}
+
+// autoDownloadMedia is fired in a goroutine for incoming messages with media
+// when AUTO_DOWNLOAD_MEDIA=true. Thin wrapper around the existing
+// downloadMedia helper used by /api/download.
+func autoDownloadMedia(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, chatJID, mediaType, filename string, logger waLog.Logger) {
+	// Small delay so the StoreMessage write commits first — otherwise
+	// downloadMedia (which re-reads the message from DB) races.
+	time.Sleep(500 * time.Millisecond)
+	ok, _, _, path, err := downloadMedia(client, messageStore, msg.Info.ID, chatJID)
+	if err != nil {
+		logger.Warnf("auto-download failed for %s/%s: %v", chatJID, msg.Info.ID, err)
+		return
+	}
+	if ok {
+		logger.Infof("auto-downloaded %s (%s) → %s", mediaType, filename, path)
+	}
 }
 
 // Extract direct path from a WhatsApp media URL
@@ -1287,6 +1425,540 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 	})
 
+	// Helper: parse phone-or-JID into types.JID
+	parseRecipient := func(s string) (types.JID, error) {
+		if strings.Contains(s, "@") {
+			return types.ParseJID(s)
+		}
+		return types.JID{User: s, Server: "s.whatsapp.net"}, nil
+	}
+	jsonOK := func(w http.ResponseWriter, message string) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": message})
+	}
+	jsonFail := func(w http.ResponseWriter, code int, msg string) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": msg})
+	}
+	requirePost := func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return false
+		}
+		return true
+	}
+
+	// /api/reply — send a text message that quotes a parent message
+	// /api/history_sync — ask the WhatsApp server for older messages in a
+	// chat. Uses whatsmeow's BuildHistorySyncRequest + a peer-message to
+	// ownID. Response arrives async as *events.HistorySync and lands in the
+	// local DB via the existing handleHistorySync path.
+	http.HandleFunc("/api/history_sync", func(w http.ResponseWriter, r *http.Request) {
+		if !requirePost(w, r) { return }
+		var req struct {
+			ChatJID string `json:"chat_jid"`
+			Count   int    `json:"count"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			jsonFail(w, 400, "invalid request"); return
+		}
+		if req.ChatJID == "" { jsonFail(w, 400, "chat_jid required"); return }
+		if req.Count <= 0 { req.Count = 50 }
+		if req.Count > 500 { req.Count = 500 }
+
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil { jsonFail(w, 400, fmt.Sprintf("bad chat_jid: %v", err)); return }
+
+		oldestID, oldestSender, oldestFromMe, oldestTS, err := messageStore.GetOldestMessage(req.ChatJID)
+		if err != nil {
+			jsonFail(w, 404, "no known messages in that chat to anchor history sync from"); return
+		}
+
+		var senderJID types.JID
+		if strings.Contains(oldestSender, "@") {
+			senderJID, _ = types.ParseJID(oldestSender)
+		} else if oldestSender != "" {
+			senderJID = types.JID{User: oldestSender, Server: types.DefaultUserServer}
+		} else {
+			senderJID = chatJID
+		}
+
+		info := &types.MessageInfo{
+			ID:        oldestID,
+			Timestamp: oldestTS,
+			MessageSource: types.MessageSource{
+				Chat:     chatJID,
+				Sender:   senderJID,
+				IsFromMe: oldestFromMe,
+				IsGroup:  chatJID.Server == "g.us",
+			},
+		}
+		msg := client.BuildHistorySyncRequest(info, req.Count)
+
+		ownID := client.Store.ID
+		if ownID == nil { jsonFail(w, 503, "client not logged in"); return }
+		_, err = client.SendMessage(context.Background(), *ownID, msg, whatsmeow.SendRequestExtra{Peer: true})
+		if err != nil {
+			jsonFail(w, 500, fmt.Sprintf("history sync request failed: %v", err)); return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":           true,
+			"message":           fmt.Sprintf("requested %d older messages for %s", req.Count, req.ChatJID),
+			"anchor_message_id": oldestID,
+			"anchor_timestamp":  oldestTS.Format(time.RFC3339),
+		})
+	})
+
+	http.HandleFunc("/api/reply", func(w http.ResponseWriter, r *http.Request) {
+		if !requirePost(w, r) { return }
+		var req struct {
+			Recipient        string `json:"recipient"`
+			Message          string `json:"message"`
+			ReplyToMessageID string `json:"reply_to_message_id"`
+			ReplyToSender    string `json:"reply_to_sender"` // JID of original sender
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil { jsonFail(w, 400, "invalid request"); return }
+		if req.Recipient == "" || req.Message == "" || req.ReplyToMessageID == "" {
+			jsonFail(w, 400, "recipient, message, reply_to_message_id required"); return
+		}
+		recipientJID, err := parseRecipient(req.Recipient)
+		if err != nil { jsonFail(w, 400, fmt.Sprintf("bad recipient: %v", err)); return }
+		quotedSender := req.ReplyToSender
+		if quotedSender == "" { quotedSender = recipientJID.String() }
+		mentions := extractMentions(req.Message)
+		ctx := &waProto.ContextInfo{
+			StanzaID:      proto.String(req.ReplyToMessageID),
+			Participant:   proto.String(quotedSender),
+			QuotedMessage: &waProto.Message{Conversation: proto.String("")},
+			MentionedJID:  mentions, // tags render only if JID is also in this array
+		}
+		msg := &waProto.Message{ExtendedTextMessage: &waProto.ExtendedTextMessage{
+			Text:        proto.String(req.Message),
+			ContextInfo: ctx,
+		}}
+		resp, err := client.SendMessage(context.Background(), recipientJID, msg)
+		if err != nil {
+			jsonFail(w, 500, fmt.Sprintf("send failed: %v", err)); return
+		}
+		// Return the message ID so the caller can later /api/edit or /api/revoke it.
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":    true,
+			"message":    "Reply sent",
+			"message_id": resp.ID,
+		})
+	})
+
+	// /api/forward — forward an existing text message to another chat
+	// (For media, use download_media + send_file from the MCP side.)
+	http.HandleFunc("/api/forward", func(w http.ResponseWriter, r *http.Request) {
+		if !requirePost(w, r) { return }
+		var req struct {
+			Recipient      string `json:"recipient"`
+			MessageID      string `json:"message_id"`
+			SourceChatJID  string `json:"source_chat_jid"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil { jsonFail(w, 400, "invalid request"); return }
+		if req.Recipient == "" || req.MessageID == "" || req.SourceChatJID == "" {
+			jsonFail(w, 400, "recipient, message_id, source_chat_jid required"); return
+		}
+		var content, mediaType string
+		err := messageStore.db.QueryRow("SELECT content, media_type FROM messages WHERE id = ? AND chat_jid = ?", req.MessageID, req.SourceChatJID).Scan(&content, &mediaType)
+		if err != nil { jsonFail(w, 404, fmt.Sprintf("source message not found: %v", err)); return }
+		if mediaType != "" {
+			jsonFail(w, 400, "media forward not supported; use download_media + send_file")
+			return
+		}
+		recipientJID, err := parseRecipient(req.Recipient)
+		if err != nil { jsonFail(w, 400, fmt.Sprintf("bad recipient: %v", err)); return }
+		// Mark as forwarded so WhatsApp shows the "Forwarded" badge
+		ctx := &waProto.ContextInfo{
+			IsForwarded:     proto.Bool(true),
+			ForwardingScore: proto.Uint32(1),
+		}
+		msg := &waProto.Message{ExtendedTextMessage: &waProto.ExtendedTextMessage{
+			Text:        proto.String(content),
+			ContextInfo: ctx,
+		}}
+		if _, err := client.SendMessage(context.Background(), recipientJID, msg); err != nil {
+			jsonFail(w, 500, fmt.Sprintf("send failed: %v", err)); return
+		}
+		jsonOK(w, "Forwarded")
+	})
+
+	// /api/edit — edit a previously-sent message (15-min window)
+	http.HandleFunc("/api/edit", func(w http.ResponseWriter, r *http.Request) {
+		if !requirePost(w, r) { return }
+		var req struct {
+			Recipient  string `json:"recipient"`
+			MessageID  string `json:"message_id"`
+			NewMessage string `json:"new_message"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil { jsonFail(w, 400, "invalid request"); return }
+		if req.Recipient == "" || req.MessageID == "" || req.NewMessage == "" {
+			jsonFail(w, 400, "recipient, message_id, new_message required"); return
+		}
+		recipientJID, err := parseRecipient(req.Recipient)
+		if err != nil { jsonFail(w, 400, fmt.Sprintf("bad recipient: %v", err)); return }
+		newContent := &waProto.Message{Conversation: proto.String(req.NewMessage)}
+		editMsg := client.BuildEdit(recipientJID, req.MessageID, newContent)
+		if _, err := client.SendMessage(context.Background(), recipientJID, editMsg); err != nil {
+			jsonFail(w, 500, fmt.Sprintf("edit failed: %v", err)); return
+		}
+		jsonOK(w, "Message edited")
+	})
+
+	// /api/revoke — delete a message for everyone (~2-day window)
+	http.HandleFunc("/api/revoke", func(w http.ResponseWriter, r *http.Request) {
+		if !requirePost(w, r) { return }
+		var req struct {
+			Recipient string `json:"recipient"`
+			MessageID string `json:"message_id"`
+			Sender    string `json:"sender"` // optional; defaults to self
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil { jsonFail(w, 400, "invalid request"); return }
+		if req.Recipient == "" || req.MessageID == "" {
+			jsonFail(w, 400, "recipient, message_id required"); return
+		}
+		chatJID, err := parseRecipient(req.Recipient)
+		if err != nil { jsonFail(w, 400, fmt.Sprintf("bad recipient: %v", err)); return }
+		var senderJID types.JID
+		if req.Sender != "" {
+			senderJID, err = parseRecipient(req.Sender)
+			if err != nil { jsonFail(w, 400, fmt.Sprintf("bad sender: %v", err)); return }
+		} else {
+			senderJID = *client.Store.ID
+		}
+		revokeMsg := client.BuildRevoke(chatJID, senderJID, req.MessageID)
+		if _, err := client.SendMessage(context.Background(), chatJID, revokeMsg); err != nil {
+			jsonFail(w, 500, fmt.Sprintf("revoke failed: %v", err)); return
+		}
+		jsonOK(w, "Message revoked")
+	})
+
+	// /api/read — send read (or delivered) receipt for one or more messages in a chat
+	http.HandleFunc("/api/read", func(w http.ResponseWriter, r *http.Request) {
+		if !requirePost(w, r) { return }
+		var req struct {
+			ChatJID     string   `json:"chat_jid"`
+			SenderJID   string   `json:"sender_jid"`   // original message sender; required for groups
+			MessageIDs  []string `json:"message_ids"`
+			ReceiptType string   `json:"receipt_type"` // "read" (default), "delivered", "played"
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil { jsonFail(w, 400, "invalid request"); return }
+		if req.ChatJID == "" || len(req.MessageIDs) == 0 {
+			jsonFail(w, 400, "chat_jid and message_ids required"); return
+		}
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil { jsonFail(w, 400, fmt.Sprintf("bad chat_jid: %v", err)); return }
+		senderJID := chatJID
+		if req.SenderJID != "" {
+			senderJID, err = types.ParseJID(req.SenderJID)
+			if err != nil { jsonFail(w, 400, fmt.Sprintf("bad sender_jid: %v", err)); return }
+		}
+		ids := make([]types.MessageID, len(req.MessageIDs))
+		for i, id := range req.MessageIDs { ids[i] = types.MessageID(id) }
+		var extra []types.ReceiptType
+		switch strings.ToLower(req.ReceiptType) {
+		case "delivered":
+			extra = append(extra, types.ReceiptTypeDelivered)
+		case "played":
+			extra = append(extra, types.ReceiptTypePlayed)
+		}
+		if err := client.MarkRead(context.Background(), ids, time.Now(), chatJID, senderJID, extra...); err != nil {
+			jsonFail(w, 500, fmt.Sprintf("MarkRead failed: %v", err)); return
+		}
+		jsonOK(w, fmt.Sprintf("Receipt sent for %d message(s)", len(ids)))
+	})
+
+	// /api/chat_read — mark all unread messages in a chat as read (batch helper)
+	http.HandleFunc("/api/chat_read", func(w http.ResponseWriter, r *http.Request) {
+		if !requirePost(w, r) { return }
+		var req struct { ChatJID string `json:"chat_jid"` }
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil { jsonFail(w, 400, "invalid request"); return }
+		if req.ChatJID == "" { jsonFail(w, 400, "chat_jid required"); return }
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil { jsonFail(w, 400, fmt.Sprintf("bad chat_jid: %v", err)); return }
+		// Group by sender and batch MarkRead per (chat, sender) tuple
+		rows, err := messageStore.db.Query(
+			"SELECT id, sender FROM messages WHERE chat_jid = ? AND is_from_me = 0 ORDER BY timestamp DESC LIMIT 200",
+			req.ChatJID,
+		)
+		if err != nil { jsonFail(w, 500, fmt.Sprintf("db query failed: %v", err)); return }
+		defer func() { _ = rows.Close() }()
+		bySender := make(map[string][]types.MessageID)
+		for rows.Next() {
+			var id, sender string
+			if err := rows.Scan(&id, &sender); err != nil { continue }
+			if sender == "" { sender = req.ChatJID }
+			bySender[sender] = append(bySender[sender], types.MessageID(id))
+		}
+		marked := 0
+		for senderStr, ids := range bySender {
+			senderJID, err := types.ParseJID(senderStr)
+			if err != nil { continue }
+			if err := client.MarkRead(context.Background(), ids, time.Now(), chatJID, senderJID); err == nil {
+				marked += len(ids)
+			}
+		}
+		jsonOK(w, fmt.Sprintf("Marked %d message(s) as read", marked))
+	})
+
+	// /api/group/info — get metadata and participants for a group JID
+	http.HandleFunc("/api/group/info", func(w http.ResponseWriter, r *http.Request) {
+		if !requirePost(w, r) { return }
+		var req struct { GroupJID string `json:"group_jid"` }
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil { jsonFail(w, 400, "invalid request"); return }
+		if req.GroupJID == "" { jsonFail(w, 400, "group_jid required"); return }
+		groupJID, err := types.ParseJID(req.GroupJID)
+		if err != nil { jsonFail(w, 400, fmt.Sprintf("bad group_jid: %v", err)); return }
+		info, err := client.GetGroupInfo(context.Background(), groupJID)
+		if err != nil { jsonFail(w, 500, fmt.Sprintf("GetGroupInfo failed: %v", err)); return }
+		participants := make([]map[string]interface{}, 0, len(info.Participants))
+		for _, p := range info.Participants {
+			participants = append(participants, map[string]interface{}{
+				"jid":          p.JID.String(),
+				"lid":          p.LID.String(),
+				"display_name": p.DisplayName,
+				"is_admin":     p.IsAdmin,
+				"is_super_admin": p.IsSuperAdmin,
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":      true,
+			"jid":          info.JID.String(),
+			"name":         info.GroupName.Name,
+			"topic":        info.GroupTopic.Topic,
+			"created":      info.GroupCreated,
+			"owner":        info.OwnerJID.String(),
+			"is_locked":    info.GroupLocked.IsLocked,
+			"is_announce":  info.GroupAnnounce.IsAnnounce,
+			"participants": participants,
+		})
+	})
+
+	// /api/group/participants — add / remove / promote / demote
+	http.HandleFunc("/api/group/participants", func(w http.ResponseWriter, r *http.Request) {
+		if !requirePost(w, r) { return }
+		var req struct {
+			GroupJID string   `json:"group_jid"`
+			Action   string   `json:"action"` // "add", "remove", "promote", "demote"
+			JIDs     []string `json:"jids"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil { jsonFail(w, 400, "invalid request"); return }
+		if req.GroupJID == "" || req.Action == "" || len(req.JIDs) == 0 {
+			jsonFail(w, 400, "group_jid, action, jids required"); return
+		}
+		groupJID, err := types.ParseJID(req.GroupJID)
+		if err != nil { jsonFail(w, 400, fmt.Sprintf("bad group_jid: %v", err)); return }
+		var change whatsmeow.ParticipantChange
+		switch strings.ToLower(req.Action) {
+		case "add":     change = whatsmeow.ParticipantChangeAdd
+		case "remove":  change = whatsmeow.ParticipantChangeRemove
+		case "promote": change = whatsmeow.ParticipantChangePromote
+		case "demote":  change = whatsmeow.ParticipantChangeDemote
+		default: jsonFail(w, 400, "action must be add|remove|promote|demote"); return
+		}
+		jids := make([]types.JID, 0, len(req.JIDs))
+		for _, s := range req.JIDs {
+			j, err := parseRecipient(s)
+			if err != nil { jsonFail(w, 400, fmt.Sprintf("bad jid %s: %v", s, err)); return }
+			jids = append(jids, j)
+		}
+		results, err := client.UpdateGroupParticipants(context.Background(), groupJID, jids, change)
+		if err != nil { jsonFail(w, 500, fmt.Sprintf("UpdateGroupParticipants failed: %v", err)); return }
+		out := make([]map[string]interface{}, 0, len(results))
+		for _, p := range results {
+			out = append(out, map[string]interface{}{
+				"jid":      p.JID.String(),
+				"is_admin": p.IsAdmin,
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":      true,
+			"message":      fmt.Sprintf("%s applied to %d participant(s)", req.Action, len(results)),
+			"participants": out,
+		})
+	})
+
+	// /api/location — send a static location share
+	http.HandleFunc("/api/location", func(w http.ResponseWriter, r *http.Request) {
+		if !requirePost(w, r) { return }
+		var req struct {
+			Recipient string  `json:"recipient"`
+			Latitude  float64 `json:"latitude"`
+			Longitude float64 `json:"longitude"`
+			Name      string  `json:"name"`
+			Address   string  `json:"address"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil { jsonFail(w, 400, "invalid request"); return }
+		if req.Recipient == "" { jsonFail(w, 400, "recipient required"); return }
+		recipientJID, err := parseRecipient(req.Recipient)
+		if err != nil { jsonFail(w, 400, fmt.Sprintf("bad recipient: %v", err)); return }
+		msg := &waProto.Message{LocationMessage: &waProto.LocationMessage{
+			DegreesLatitude:  proto.Float64(req.Latitude),
+			DegreesLongitude: proto.Float64(req.Longitude),
+			Name:             proto.String(req.Name),
+			Address:          proto.String(req.Address),
+		}}
+		if _, err := client.SendMessage(context.Background(), recipientJID, msg); err != nil {
+			jsonFail(w, 500, fmt.Sprintf("send failed: %v", err)); return
+		}
+		jsonOK(w, "Location sent")
+	})
+
+	// /api/sticker — send a .webp sticker
+	http.HandleFunc("/api/sticker", func(w http.ResponseWriter, r *http.Request) {
+		if !requirePost(w, r) { return }
+		var req struct {
+			Recipient   string `json:"recipient"`
+			StickerPath string `json:"sticker_path"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil { jsonFail(w, 400, "invalid request"); return }
+		if req.Recipient == "" || req.StickerPath == "" { jsonFail(w, 400, "recipient and sticker_path required"); return }
+		if !strings.HasSuffix(strings.ToLower(req.StickerPath), ".webp") {
+			jsonFail(w, 400, "sticker must be a .webp file"); return
+		}
+		recipientJID, err := parseRecipient(req.Recipient)
+		if err != nil { jsonFail(w, 400, fmt.Sprintf("bad recipient: %v", err)); return }
+		data, err := os.ReadFile(req.StickerPath)
+		if err != nil { jsonFail(w, 400, fmt.Sprintf("read sticker: %v", err)); return }
+		resp, err := client.Upload(context.Background(), data, whatsmeow.MediaImage)
+		if err != nil { jsonFail(w, 500, fmt.Sprintf("upload failed: %v", err)); return }
+		msg := &waProto.Message{StickerMessage: &waProto.StickerMessage{
+			URL:           &resp.URL,
+			DirectPath:    &resp.DirectPath,
+			MediaKey:      resp.MediaKey,
+			Mimetype:      proto.String("image/webp"),
+			FileEncSHA256: resp.FileEncSHA256,
+			FileSHA256:    resp.FileSHA256,
+			FileLength:    &resp.FileLength,
+		}}
+		if _, err := client.SendMessage(context.Background(), recipientJID, msg); err != nil {
+			jsonFail(w, 500, fmt.Sprintf("send failed: %v", err)); return
+		}
+		jsonOK(w, "Sticker sent")
+	})
+
+	// /api/calls/recent — list recent incoming-call events from the local DB
+	http.HandleFunc("/api/calls/recent", func(w http.ResponseWriter, r *http.Request) {
+		if !requirePost(w, r) { return }
+		var req struct {
+			Limit int    `json:"limit"`
+			After string `json:"after"` // ISO timestamp
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Limit <= 0 || req.Limit > 500 { req.Limit = 50 }
+		var rows *sql.Rows
+		var err error
+		if req.After != "" {
+			rows, err = messageStore.db.Query(
+				"SELECT call_id, caller_jid, from_jid, event_type, media, is_group, timestamp FROM calls WHERE timestamp > ? ORDER BY timestamp DESC LIMIT ?",
+				req.After, req.Limit,
+			)
+		} else {
+			rows, err = messageStore.db.Query(
+				"SELECT call_id, caller_jid, from_jid, event_type, media, is_group, timestamp FROM calls ORDER BY timestamp DESC LIMIT ?",
+				req.Limit,
+			)
+		}
+		if err != nil { jsonFail(w, 500, fmt.Sprintf("db query failed: %v", err)); return }
+		defer func() { _ = rows.Close() }()
+		out := make([]map[string]interface{}, 0)
+		for rows.Next() {
+			var callID, callerJID, fromJID, eventType, media string
+			var isGroup bool
+			var ts time.Time
+			if err := rows.Scan(&callID, &callerJID, &fromJID, &eventType, &media, &isGroup, &ts); err == nil {
+				out = append(out, map[string]interface{}{
+					"call_id":    callID,
+					"caller_jid": callerJID,
+					"from_jid":   fromJID,
+					"event_type": eventType,
+					"media":      media,
+					"is_group":   isGroup,
+					"timestamp":  ts.Format(time.RFC3339),
+				})
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "calls": out})
+	})
+
+	// Handler for sending an emoji reaction to an existing message
+	http.HandleFunc("/api/react", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Recipient string `json:"recipient"`
+			MessageID string `json:"message_id"`
+			Emoji     string `json:"emoji"`
+			FromMe    bool   `json:"from_me"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.Recipient == "" || req.MessageID == "" || req.Emoji == "" {
+			http.Error(w, "recipient, message_id, and emoji are required", http.StatusBadRequest)
+			return
+		}
+
+		var recipientJID types.JID
+		var err error
+		if strings.Contains(req.Recipient, "@") {
+			recipientJID, err = types.ParseJID(req.Recipient)
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("Error parsing JID: %v", err),
+				})
+				return
+			}
+		} else {
+			recipientJID = types.JID{User: req.Recipient, Server: "s.whatsapp.net"}
+		}
+
+		remoteJIDStr := recipientJID.String()
+		fromMe := req.FromMe
+		ts := time.Now().UnixMilli()
+
+		msg := &waProto.Message{
+			ReactionMessage: &waProto.ReactionMessage{
+				Key: &waProto.MessageKey{
+					RemoteJID: &remoteJIDStr,
+					FromMe:    &fromMe,
+					ID:        &req.MessageID,
+				},
+				Text:              &req.Emoji,
+				SenderTimestampMS: &ts,
+			},
+		}
+
+		_, sendErr := client.SendMessage(context.Background(), recipientJID, msg)
+		w.Header().Set("Content-Type", "application/json")
+		if sendErr != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Error sending reaction: %v", sendErr),
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": fmt.Sprintf("Reaction %s sent to %s on message %s", req.Emoji, req.Recipient, req.MessageID),
+		})
+	})
+
 	// Start the server with proper timeouts
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -1413,6 +2085,18 @@ func main() {
 
 		case *events.ClientOutdated:
 			logger.Errorf("❌ Client outdated - please update whatsmeow library")
+
+		case *events.CallOffer:
+			logCallEvent(messageStore, v.CallID, v.CallCreator.String(), v.From.String(), "offer", "", false)
+		case *events.CallOfferNotice:
+			isGroup := v.Type == "group"
+			logCallEvent(messageStore, v.CallID, v.CallCreator.String(), v.CallCreator.String(), "offer_notice", v.Media, isGroup)
+		case *events.CallAccept:
+			logCallEvent(messageStore, v.CallID, v.CallCreator.String(), v.From.String(), "accept", "", false)
+		case *events.CallTerminate:
+			logCallEvent(messageStore, v.CallID, v.CallCreator.String(), v.From.String(), "terminate:"+v.Reason, "", false)
+		case *events.CallReject:
+			logCallEvent(messageStore, v.CallID, v.CallCreator.String(), v.From.String(), "reject", "", false)
 		}
 	})
 

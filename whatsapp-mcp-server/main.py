@@ -41,6 +41,42 @@ from whatsapp import (
     send_file as whatsapp_send_file,
 )
 from whatsapp import (
+    edit_message as whatsapp_edit_message,
+)
+from whatsapp import (
+    forward_message as whatsapp_forward_message,
+)
+from whatsapp import (
+    get_group_info as whatsapp_get_group_info,
+)
+from whatsapp import (
+    list_recent_calls as whatsapp_list_recent_calls,
+)
+from whatsapp import (
+    mark_chat_read as whatsapp_mark_chat_read,
+)
+from whatsapp import (
+    mark_messages_read as whatsapp_mark_messages_read,
+)
+from whatsapp import (
+    react_to_message as whatsapp_react_to_message,
+)
+from whatsapp import (
+    reply_to_message as whatsapp_reply_to_message,
+)
+from whatsapp import (
+    revoke_message as whatsapp_revoke_message,
+)
+from whatsapp import (
+    send_location as whatsapp_send_location,
+)
+from whatsapp import (
+    send_sticker as whatsapp_send_sticker,
+)
+from whatsapp import (
+    update_group_participants as whatsapp_update_group_participants,
+)
+from whatsapp import (
     send_message as whatsapp_send_message,
 )
 
@@ -314,6 +350,195 @@ def send_message(recipient: str, message: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+def reply_to_message(
+    recipient: str, message: str, reply_to_message_id: str, reply_to_sender: str = ""
+) -> dict[str, Any]:
+    """Send a text message that quotes a parent message (proper threaded reply).
+
+    Args:
+        recipient: Phone (no +) or JID of the chat to reply in.
+        message: The reply text.
+        reply_to_message_id: The ID of the message being replied to.
+        reply_to_sender: JID of the original sender. Required for groups; for 1:1 chats
+                        it can be left blank and will default to the chat JID.
+    """
+    success, status = whatsapp_reply_to_message(
+        recipient, message, reply_to_message_id, reply_to_sender
+    )
+    return {"success": success, "message": status}
+
+
+@mcp.tool()
+def forward_message(
+    recipient: str, message_id: str, source_chat_jid: str
+) -> dict[str, Any]:
+    """Forward an existing TEXT message to another chat with the "Forwarded" badge.
+
+    For media messages, use download_media + send_file from the calling side instead.
+
+    Args:
+        recipient: Where to forward the message to.
+        message_id: ID of the message to forward.
+        source_chat_jid: JID of the chat the original message lives in.
+    """
+    success, status = whatsapp_forward_message(recipient, message_id, source_chat_jid)
+    return {"success": success, "message": status}
+
+
+@mcp.tool()
+def edit_message(recipient: str, message_id: str, new_message: str) -> dict[str, Any]:
+    """Edit a previously-sent text message. WhatsApp allows ~15 minutes after the original send.
+
+    Args:
+        recipient: The chat the message lives in.
+        message_id: The ID of the message to edit.
+        new_message: The new text content.
+    """
+    success, status = whatsapp_edit_message(recipient, message_id, new_message)
+    return {"success": success, "message": status}
+
+
+@mcp.tool()
+def revoke_message(
+    recipient: str, message_id: str, sender: str = ""
+) -> dict[str, Any]:
+    """Delete a sent message for everyone ("revoke"). WhatsApp allows ~2 days after send.
+
+    Args:
+        recipient: The chat the message is in.
+        message_id: The ID of the message to revoke.
+        sender: JID of the message sender. Defaults to self.
+    """
+    success, status = whatsapp_revoke_message(recipient, message_id, sender)
+    return {"success": success, "message": status}
+
+
+@mcp.tool()
+def mark_messages_read(
+    chat_jid: str,
+    message_ids: list[str],
+    sender_jid: str = "",
+    receipt_type: str = "read",
+) -> dict[str, Any]:
+    """Send read (or delivered/played) receipts for one or more messages in a chat.
+
+    Args:
+        chat_jid: The JID of the chat.
+        message_ids: List of message IDs to acknowledge.
+        sender_jid: Original sender's JID (required for groups; defaults to the chat for DMs).
+        receipt_type: "read" (default), "delivered", or "played" (for voice notes).
+    """
+    success, status = whatsapp_mark_messages_read(
+        chat_jid, message_ids, sender_jid, receipt_type
+    )
+    return {"success": success, "message": status}
+
+
+@mcp.tool()
+def mark_chat_read(chat_jid: str) -> dict[str, Any]:
+    """Batch-mark every locally-stored unread message in a chat as read.
+
+    Args:
+        chat_jid: The JID of the chat to clear unread state for.
+    """
+    success, status = whatsapp_mark_chat_read(chat_jid)
+    return {"success": success, "message": status}
+
+
+@mcp.tool()
+def get_group_info(group_jid: str) -> dict[str, Any]:
+    """Get full metadata for a WhatsApp group: name, topic, owner, participants and admin status.
+
+    Args:
+        group_jid: The group JID (ends with @g.us).
+    """
+    return whatsapp_get_group_info(group_jid)
+
+
+@mcp.tool()
+def update_group_participants(
+    group_jid: str, action: str, jids: list[str]
+) -> dict[str, Any]:
+    """Add, remove, promote, or demote participants in a WhatsApp group.
+
+    Args:
+        group_jid: The group JID (ends with @g.us).
+        action: One of "add", "remove", "promote", "demote".
+        jids: Phone numbers (no +) or JIDs of the participants to act on.
+    """
+    success, status, participants = whatsapp_update_group_participants(
+        group_jid, action, jids
+    )
+    return {"success": success, "message": status, "participants": participants}
+
+
+@mcp.tool()
+def send_location(
+    recipient: str,
+    latitude: float,
+    longitude: float,
+    name: str = "",
+    address: str = "",
+) -> dict[str, Any]:
+    """Send a static location share to a chat.
+
+    Args:
+        recipient: Phone (no +) or JID of the destination chat.
+        latitude: Decimal latitude (e.g. 12.9716).
+        longitude: Decimal longitude (e.g. 77.5946).
+        name: Optional place name.
+        address: Optional postal-style address.
+    """
+    success, status = whatsapp_send_location(recipient, latitude, longitude, name, address)
+    return {"success": success, "message": status}
+
+
+@mcp.tool()
+def send_sticker(recipient: str, sticker_path: str) -> dict[str, Any]:
+    """Send a sticker (.webp) to a chat.
+
+    Args:
+        recipient: Phone (no +) or JID of the destination chat.
+        sticker_path: Absolute path to a .webp file.
+    """
+    success, status = whatsapp_send_sticker(recipient, sticker_path)
+    return {"success": success, "message": status}
+
+
+@mcp.tool()
+def list_recent_calls(limit: int = 50, after: str = "") -> dict[str, Any]:
+    """List recent incoming-call events captured from the WhatsApp event stream.
+
+    The bridge logs CallOffer / CallAccept / CallTerminate / CallReject events into a local table.
+    This tool reads that table.
+
+    Args:
+        limit: Max number of events to return (default 50, max 500).
+        after: Optional ISO-8601 timestamp; only events newer than this are returned.
+    """
+    return whatsapp_list_recent_calls(limit, after)
+
+
+@mcp.tool()
+def react_to_message(
+    recipient: str, message_id: str, emoji: str, from_me: bool = True
+) -> dict[str, Any]:
+    """Send an emoji reaction to an existing WhatsApp message.
+
+    Args:
+        recipient: Phone number (no +) or full JID of the chat the message is in.
+        message_id: The ID of the message to react to.
+        emoji: The reaction emoji to send (e.g. "👍", "❤️", "😂"). Pass an empty string to remove a prior reaction.
+        from_me: True if the original message was sent by this account, False if it was received from someone else. Default True.
+
+    Returns:
+        A dictionary containing success status and a status message.
+    """
+    success, status_message = whatsapp_react_to_message(recipient, message_id, emoji, from_me)
+    return {"success": success, "message": status_message}
+
+
+@mcp.tool()
 def send_file(recipient: str, media_path: str) -> dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
 
@@ -364,6 +589,119 @@ def download_media(message_id: str, chat_jid: str) -> dict[str, Any]:
         return {"success": True, "message": "Media downloaded successfully", "file_path": file_path}
     else:
         return {"success": False, "message": "Failed to download media"}
+
+
+@mcp.tool()
+def search_messages(
+    query: str,
+    chat_jid: str | None = None,
+    after: str | None = None,
+    before: str | None = None,
+    limit: int = 30,
+) -> list[dict[str, Any]]:
+    """Full-text search across every message in the local DB. Powered by
+    SQLite FTS5 — typically <100ms across 10s of thousands of messages.
+
+    The query supports FTS5 syntax:
+      - plain words: aws cost          → matches messages with both
+      - phrase:     "aws cost"         → exact phrase
+      - prefix:     sage*              → matches SageMaker, sagemaker etc.
+      - boolean:    aws AND credit
+      - NEAR:       NEAR(aws credit, 10)  → both words within 10 tokens
+    Diacritics are stripped at index time (Muñoz matches "munoz").
+
+    Args:
+        query: FTS5 query string
+        chat_jid: Optional — restrict to one chat
+        after, before: ISO-8601 timestamps to bound the time window
+        limit: max rows returned (default 30, sorted by bm25 relevance)
+
+    Returns:
+        List of matching messages with chat name + sender, ranked by relevance.
+    """
+    from whatsapp import search_messages as _search
+    return _search(query=query, chat_jid=chat_jid, after=after, before=before, limit=limit)
+
+
+@mcp.tool()
+def catch_up(
+    hours: int = 12,
+    awaiting_my_reply: bool = False,
+    include_groups: bool = True,
+    include_dms: bool = True,
+    limit_chats: int = 30,
+) -> dict[str, Any]:
+    """Per-chat activity rollup over the last N hours — designed for inbox
+    triage when you've been away.
+
+    Returns chat name, message count, unique senders, last message preview
+    (sender + text) for each active chat. Sorted by recency.
+
+    Args:
+        hours: lookback window (default 12)
+        awaiting_my_reply: True → only chats where the last message wasn't
+                           yours (still waiting for your reply). The DB
+                           doesn't track WhatsApp's actual read state, so
+                           this is the closest available semantic.
+        include_groups: include @g.us JIDs
+        include_dms: include 1:1 JIDs (@s.whatsapp.net / @lid)
+        limit_chats: cap at this many chats (newest activity first)
+
+    Returns:
+        {window_hours, since, total_chats, total_messages, chats: [...]}
+        On error: same shape with chats=[] and an `error` key.
+    """
+    from whatsapp import catch_up as _catch_up
+    return _catch_up(
+        hours=hours,
+        awaiting_my_reply=awaiting_my_reply,
+        include_groups=include_groups,
+        include_dms=include_dms,
+        limit_chats=limit_chats,
+    )
+
+
+@mcp.tool()
+def transcribe_audio(
+    message_id: str,
+    chat_jid: str,
+    provider: str | None = None,
+    language: str = "en",
+) -> dict[str, Any]:
+    """Transcribe a voice / audio message to text.
+
+    Auto-picks provider based on env (priority: explicit arg →
+    WHATSAPP_TRANSCRIBE_PROVIDER env → OPENAI_API_KEY → SARVAM_API_KEY).
+    Sarvam saarika handles Hindi / code-switched Hinglish well; OpenAI
+    Whisper is broader.
+
+    Args:
+        message_id, chat_jid: identify the voice message in the local DB
+        provider: 'openai' or 'sarvam' (overrides auto-pick)
+        language: ISO code — 'en' (default), 'hi', 'hi-IN', 'en-IN'
+
+    Returns:
+        {'success': bool, 'text': '...', 'provider': '...', 'audio_path': '...'}
+    """
+    from whatsapp import transcribe_audio as _transcribe
+    return _transcribe(message_id=message_id, chat_jid=chat_jid, provider=provider, language=language)
+
+
+@mcp.tool()
+def request_history(chat_jid: str, count: int = 100) -> dict[str, Any]:
+    """Request older messages from the WhatsApp server for a chat. The
+    bridge handles the async response — older messages will appear in
+    subsequent list_messages calls within seconds.
+
+    Args:
+        chat_jid: e.g. '120363420428178043@g.us'
+        count: how many older messages to fetch (1-500, default 100)
+
+    Returns:
+        {'success': bool, 'message': '...'}
+    """
+    from whatsapp import request_history as _request_history
+    return _request_history(chat_jid=chat_jid, count=count)
 
 
 def shutdown_handler(signum, frame):
