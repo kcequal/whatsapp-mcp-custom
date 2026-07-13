@@ -965,7 +965,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Send webhook for incoming messages
 	// Forward self-messages when FORWARD_SELF=true
 	if content != "" && (forwardSelfMessages || !msg.Info.IsFromMe) {
-		SendWebhook(sender, content, chatJID, msg.Info.IsFromMe, quotedMessageId, quotedSender, quotedContent)
+		SendWebhook(msg.Info.ID, sender, content, chatJID, msg.Info.IsFromMe, quotedMessageId, quotedSender, quotedContent)
 	}
 
 	if err != nil {
