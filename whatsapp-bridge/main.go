@@ -1214,8 +1214,11 @@ func extractDirectPathFromURL(url string) string {
 
 	pathPart := parts[1]
 
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
+	// Keep the query string (?ccb=&oh=&oe=&_nc_sid=&mms3=true). WhatsApp's media
+	// CDN now REQUIRES the signed oh/oe tokens on every download and returns 403
+	// without them. whatsmeow rebuilds the URL as host + directPath + "&hash=...",
+	// so leaving the query on directPath yields host+/path?...signed...&hash=...,
+	// which the CDN accepts. Stripping it here caused 403 on all media (any age).
 
 	// Create proper direct path format
 	return "/" + pathPart
