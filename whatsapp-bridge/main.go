@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -1075,6 +1076,11 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 	return d.MediaType
 }
 
+// Per-message download locks: the event-handler goroutine and the listener's
+// /api/download can request the same media concurrently; without this, both
+// pass the existence check and race the write.
+var mediaDownloadLocks sync.Map // "messageID|chatJID" -> *sync.Mutex
+
 // sanitizeIDForFilename keeps a WhatsApp message ID filesystem-safe (IDs are
 // uppercase hex in practice, but never trust an external ID in a path).
 func sanitizeIDForFilename(id string) string {
@@ -1132,6 +1138,13 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	// two media messages land in the same second, silently serving the WRONG
 	// file to whoever asks second (e.g. transcribing voice note A as B).
 	filename := fmt.Sprintf("%s_%s_%s%s", mediaType, timestamp.Format("20060102_150405"), sanitizeIDForFilename(messageID), ext)
+
+	// Serialize per message: only one goroutine may check-then-download a given
+	// media file at a time.
+	lockAny, _ := mediaDownloadLocks.LoadOrStore(messageID+"|"+chatJID, &sync.Mutex{})
+	lock := lockAny.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
 
 	// First, check if we already have this file
 	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
@@ -1198,12 +1211,23 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
 
-	// Save atomically (tmp + rename): the existence check above is unlocked, so
-	// a concurrent goroutine/API caller must never observe a half-written file.
-	tmpPath := fmt.Sprintf("%s.tmp.%d", localPath, os.Getpid())
-	if err := os.WriteFile(tmpPath, mediaData, 0644); err != nil {
+	// Save atomically (unique tmp + rename): a reader must never observe a
+	// half-written file, and concurrent writers must never share a tmp path.
+	tmpFile, err := os.CreateTemp(chatDir, filename+".tmp-*")
+	if err != nil {
+		return false, "", "", "", fmt.Errorf("failed to create temp media file: %v", err)
+	}
+	tmpPath := tmpFile.Name()
+	if _, err := tmpFile.Write(mediaData); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
 	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return false, "", "", "", fmt.Errorf("failed to close media file: %v", err)
+	}
+	_ = os.Chmod(tmpPath, 0644)
 	if err := os.Rename(tmpPath, localPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return false, "", "", "", fmt.Errorf("failed to finalize media file: %v", err)
