@@ -962,10 +962,15 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		go autoDownloadMedia(client, messageStore, msg, chatJID, mediaType, filename, logger)
 	}
 
-	// Send webhook for incoming messages
-	// Forward self-messages when FORWARD_SELF=true
-	if content != "" && (forwardSelfMessages || !msg.Info.IsFromMe) {
-		SendWebhook(msg.Info.ID, sender, content, chatJID, msg.Info.IsFromMe, quotedMessageId, quotedSender, quotedContent)
+	// Send webhook for incoming messages (text OR media — a voice note has
+	// empty content, and the old content-only guard meant the listener never
+	// heard about it at all). Forward self-messages when FORWARD_SELF=true.
+	if (content != "" || mediaType != "") && (forwardSelfMessages || !msg.Info.IsFromMe) {
+		isPTT := false
+		if aud := msg.Message.GetAudioMessage(); aud != nil {
+			isPTT = aud.GetPTT()
+		}
+		SendWebhook(msg.Info.ID, sender, content, chatJID, msg.Info.IsFromMe, quotedMessageId, quotedSender, quotedContent, mediaType, filename, fileLength, isPTT)
 	}
 
 	if err != nil {
@@ -1070,6 +1075,21 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 	return d.MediaType
 }
 
+// sanitizeIDForFilename keeps a WhatsApp message ID filesystem-safe (IDs are
+// uppercase hex in practice, but never trust an external ID in a path).
+func sanitizeIDForFilename(id string) string {
+	var b strings.Builder
+	for _, r := range id {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "noid"
+	}
+	return b.String()
+}
+
 // Function to download media from a message
 func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
 	// Query the database for the message including timestamp
@@ -1108,7 +1128,10 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	default:
 		ext = ""
 	}
-	filename := fmt.Sprintf("%s_%s%s", mediaType, timestamp.Format("20060102_150405"), ext)
+	// Message ID in the name: a second-resolution timestamp alone collides when
+	// two media messages land in the same second, silently serving the WRONG
+	// file to whoever asks second (e.g. transcribing voice note A as B).
+	filename := fmt.Sprintf("%s_%s_%s%s", mediaType, timestamp.Format("20060102_150405"), sanitizeIDForFilename(messageID), ext)
 
 	// First, check if we already have this file
 	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
@@ -1175,9 +1198,15 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
 
-	// Save the downloaded media to file
-	if err := os.WriteFile(localPath, mediaData, 0644); err != nil {
+	// Save atomically (tmp + rename): the existence check above is unlocked, so
+	// a concurrent goroutine/API caller must never observe a half-written file.
+	tmpPath := fmt.Sprintf("%s.tmp.%d", localPath, os.Getpid())
+	if err := os.WriteFile(tmpPath, mediaData, 0644); err != nil {
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
+	}
+	if err := os.Rename(tmpPath, localPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return false, "", "", "", fmt.Errorf("failed to finalize media file: %v", err)
 	}
 
 	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
