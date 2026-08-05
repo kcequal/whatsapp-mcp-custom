@@ -373,6 +373,12 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	return err
 }
 
+// RenameChat updates only the display name, leaving last_message_time alone.
+func (store *MessageStore) RenameChat(jid, name string) error {
+	_, err := store.db.Exec("UPDATE chats SET name = ? WHERE jid = ?", name, jid)
+	return err
+}
+
 // TouchChat bumps a chat's last_message_time without touching its name.
 // StoreChat is INSERT OR REPLACE, so calling it from the outgoing path (where
 // we have no display name to hand) would blank an existing chat's name.
@@ -514,7 +520,23 @@ func extractTextContent(msg *waProto.Message) string {
 		return extendedText.GetText()
 	}
 
-	// For now, we're ignoring non-text messages
+	// Media captions are text too. Without these, an image posted with a
+	// paragraph of context stores as an empty row: the daily cost digests all
+	// landed as media_type='image' with no content, so "what did we send them"
+	// and any keyword search over media messages came back empty.
+	if img := msg.GetImageMessage(); img != nil {
+		return img.GetCaption()
+	} else if vid := msg.GetVideoMessage(); vid != nil {
+		return vid.GetCaption()
+	} else if doc := msg.GetDocumentMessage(); doc != nil {
+		if cap := doc.GetCaption(); cap != "" {
+			return cap
+		}
+		// A document usually has no caption; its filename is the only text
+		// that says what it is.
+		return doc.GetFileName()
+	}
+
 	return ""
 }
 
@@ -992,18 +1014,11 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		return
 	}
 
-	// Auto-download media if present
-	if mediaType != "" && url != "" && len(mediaKey) > 0 {
-		logger.Infof("Auto-downloading %s media for message %s", mediaType, msg.Info.ID)
-		go func() {
-			success, _, _, downloadPath, err := downloadMedia(client, messageStore, msg.Info.ID, chatJID)
-			if success && err == nil {
-				logger.Infof("✅ Auto-downloaded media: %s", downloadPath)
-			} else {
-				logger.Warnf("❌ Auto-download failed: %v", err)
-			}
-		}()
-	}
+	// NOTE: a second download used to fire here, BEFORE StoreMessage. downloadMedia
+	// re-reads the message from the DB, so it raced the insert it depends on and
+	// lost most of the time — 471 "failed to find message: sql: no rows" against
+	// 133 successes in the current log. Removed; autoDownloadMedia below is the
+	// single download path and waits for the write to commit.
 
 	// Store message in database
 	err = messageStore.StoreMessage(
@@ -1022,10 +1037,16 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileLength,
 	)
 
-	// Auto-download media to disk if AUTO_DOWNLOAD_MEDIA=true. Saves the
-	// API-roundtrip when the agent later wants the file. Skips own-sent
-	// messages by default (those usually originated locally anyway).
-	if mediaType != "" && os.Getenv("AUTO_DOWNLOAD_MEDIA") == "true" && !msg.Info.IsFromMe {
+	// Download every piece of media that arrives, unconditionally.
+	//
+	// This used to be gated on AUTO_DOWNLOAD_MEDIA=true and to skip own-sends.
+	// Both were wrong in practice: the env var was never set on this box, so a
+	// PDF dropped in a group (the murf.ai deck, 5 Aug) existed only as a row
+	// with no file behind it, and every later "read that attachment" needed a
+	// manual fetch that nobody did. KC's call 2026-08-06: pull everything.
+	//
+	// Set AUTO_DOWNLOAD_MEDIA=false to opt back out.
+	if mediaType != "" && os.Getenv("AUTO_DOWNLOAD_MEDIA") != "false" {
 		go autoDownloadMedia(client, messageStore, msg, chatJID, mediaType, filename, logger)
 	}
 
@@ -2177,6 +2198,19 @@ func main() {
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
 
+		case *events.GroupInfo:
+			// A chat name is written once and then cached forever, so a renamed
+			// group keeps its old subject indefinitely — the AD working group read
+			// as "AD - KR - RR - KC" for days after it became "AD - KR - RR - KC - AK".
+			// Renames arrive as an event; take them.
+			if v.Name != nil && v.Name.Name != "" {
+				if err := messageStore.RenameChat(v.JID.String(), v.Name.Name); err != nil {
+					logger.Warnf("Failed to rename chat %s: %v", v.JID, err)
+				} else {
+					logger.Infof("Group renamed: %s → %s", v.JID, v.Name.Name)
+				}
+			}
+
 		case *events.Connected:
 			logger.Infof("✓ Successfully connected to WhatsApp servers")
 
@@ -2393,11 +2427,40 @@ connectionSuccess:
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info
+// isIdentifierNotName reports whether a stored chat "name" is really just an
+// identifier wearing a name's clothes — an all-digit string (a phone number or a
+// LID), or the chat's own JID user. These are the values that make a failed
+// lookup indistinguishable from a successful one.
+func isIdentifierNotName(name string, jid types.JID) bool {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return true
+	}
+	if trimmed == jid.User || trimmed == jid.String() {
+		return true
+	}
+	// A group subject could legitimately be numeric ("2026 Planning"), so only
+	// treat a bare run of digits long enough to be a phone number or LID as an ID.
+	if len(trimmed) >= 10 {
+		for _, r := range trimmed {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
-	// First, check if chat already exists in database with a name
+	// First, check if chat already exists in database with a name.
+	// A cached name that is really just an ID is worse than no name: it looks
+	// like a resolved answer to every caller (get_contact returns it verbatim),
+	// which is how the Buddy account's LID ended up being read as KC's identity.
+	// Treat those as unset and try to resolve properly again.
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
+	if err == nil && existingName != "" && !isIdentifierNotName(existingName, jid) {
 		// Chat exists with a name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
@@ -2457,17 +2520,32 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
+		// Prefer a real, human name. Never invent one out of an identifier:
+		// `name = sender` used to run here, which is how KC's DM thread ended up
+		// named "81141293912122" (the Buddy account's LID, because Buddy happened
+		// to send the first stored message in that thread). Downstream that reads
+		// as a resolved contact name and misidentifies the person.
 		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
-		} else if sender != "" {
-			// Fallback to sender
-			name = sender
-		} else {
-			// Last fallback to JID
-			name = jid.User
+		if err == nil {
+			switch {
+			case contact.FullName != "":
+				name = contact.FullName
+			case contact.BusinessName != "":
+				name = contact.BusinessName
+			case contact.PushName != "":
+				name = contact.PushName
+			}
 		}
+		// If it is a LID, the phone number is a far better label than the LID —
+		// at least it is the identifier a human recognises.
+		if name == "" && jid.Server == types.HiddenUserServer {
+			if pn, pnErr := client.Store.LIDs.GetPNForLID(context.Background(), jid); pnErr == nil && !pn.IsEmpty() {
+				name = pn.User
+			}
+		}
+		// Otherwise leave it EMPTY. handleMessage fills it in from PushName on the
+		// next inbound message, and an empty name lets callers fall back to the JID
+		// instead of trusting a number that looks like a name.
 
 		logger.Infof("Using contact name: %s", name)
 	}
