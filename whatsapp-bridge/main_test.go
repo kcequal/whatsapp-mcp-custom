@@ -550,3 +550,123 @@ func TestIsIdentifierNotName_GroupNamesKept(t *testing.T) {
 		t.Error("a real contact name should be kept")
 	}
 }
+
+// --- Regression tests for the round-2 QA findings ---
+
+// canonicalSender must never guess. E.164 allows up to 15 digits, so the old
+// "digits and longer than 13 means LID" rule would permanently relabel a valid
+// long phone number as a LID.
+func TestCanonicalSender_DoesNotGuessLongNumbers(t *testing.T) {
+	lid2pn := map[string]string{"185366493536339": "11234567890"}
+	pn2lid := map[string]string{"11234567890": "185366493536339"}
+
+	cases := []struct{ raw, wantSender, wantLID string }{
+		{"185366493536339", "11234567890", "185366493536339"},      // known LID
+		{"11234567890", "11234567890", "185366493536339"},          // known phone
+		{"999888777666555@lid", "999888777666555@lid", "999888777666555"}, // marked, unknown
+		{"123456789012345", "123456789012345", ""},                 // 15 digits, unknown: leave alone
+		{"12345678901234", "12345678901234", ""},                   // 14 digits, unknown: leave alone
+	}
+	for _, c := range cases {
+		gotS, gotL := canonicalSender(c.raw, lid2pn, pn2lid)
+		if gotS != c.wantSender || gotL != c.wantLID {
+			t.Errorf("canonicalSender(%q) = (%q,%q), want (%q,%q)", c.raw, gotS, gotL, c.wantSender, c.wantLID)
+		}
+	}
+}
+
+// The old guard tested `sender_lid IS NULL` while the migration writes '',
+// so it could neither tell done from pending. Second run must be a no-op.
+func TestNormalizeExistingSenders_Idempotent(t *testing.T) {
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+	dir := t.TempDir()
+	wa := filepath.Join(dir, "whatsapp.db")
+	wdb, err := sql.Open("sqlite3", wa)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := wdb.Exec(`CREATE TABLE whatsmeow_lid_map (lid TEXT PRIMARY KEY, pn TEXT UNIQUE NOT NULL);
+		INSERT INTO whatsmeow_lid_map VALUES ('185366493536339','11234567890');`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	_ = wdb.Close()
+
+	chat := "11234567890@s.whatsapp.net"
+	if err := ms.TouchChat(chat, time.Now()); err != nil {
+		t.Fatalf("TouchChat: %v", err)
+	}
+	if err := ms.StoreMessage("m1", chat, "185366493536339", "", "hello",
+		time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+
+	if err := ms.NormalizeExistingSenders(wa, logger); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	var sender, senderLID string
+	if err := ms.db.QueryRow(`SELECT sender, COALESCE(sender_lid,'') FROM messages WHERE id='m1'`).
+		Scan(&sender, &senderLID); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if sender != "11234567890" || senderLID != "185366493536339" {
+		t.Fatalf("after first run got (%q,%q), want (11234567890,185366493536339)", sender, senderLID)
+	}
+
+	// Second run must find nothing to do. If the guard is wrong it rewrites every
+	// mapped sender and rebuilds the index on every single startup.
+	before := countSenderWrites(t, ms)
+	if err := ms.NormalizeExistingSenders(wa, logger); err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if after := countSenderWrites(t, ms); after != before {
+		t.Errorf("second run was not a no-op: %q -> %q", before, after)
+	}
+}
+
+// countSenderWrites is a cheap proxy: the data must be unchanged after a no-op run.
+func countSenderWrites(t *testing.T, ms *MessageStore) string {
+	t.Helper()
+	var s string
+	if err := ms.db.QueryRow(`SELECT group_concat(sender||'/'||COALESCE(sender_lid,'')) FROM messages`).Scan(&s); err != nil {
+		t.Fatalf("proxy read: %v", err)
+	}
+	return s
+}
+
+// A message stored while the search index did not exist must become searchable
+// once it does; an external-content FTS table does not index existing rows.
+func TestNewMessageStore_ReconcilesStaleSearchIndex(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chat := "919060899999@s.whatsapp.net"
+	if err := ms.TouchChat(chat, time.Now()); err != nil {
+		t.Fatalf("TouchChat: %v", err)
+	}
+	// Write directly, bypassing StoreMessage's index maintenance, to simulate a
+	// row that predates the index.
+	if _, err := ms.db.Exec(
+		`INSERT INTO messages (id, chat_jid, sender, sender_lid, content, timestamp, is_from_me)
+		 VALUES ('old','`+chat+`','919060899999','','murfalcondeck',?,0)`, time.Now()); err != nil {
+		t.Fatalf("direct insert: %v", err)
+	}
+
+	var indexed int
+	if err := ms.db.QueryRow(`SELECT COUNT(*) FROM messages_fts_docsize`).Scan(&indexed); err != nil {
+		t.Fatalf("docsize: %v", err)
+	}
+	if indexed != 0 {
+		t.Fatalf("test setup failed to create a stale index: %d indexed", indexed)
+	}
+
+	if err := ms.reconcileSearchIndex(); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	var hits int
+	if err := ms.db.QueryRow(
+		`SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'murfalcondeck'`).Scan(&hits); err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if hits != 1 {
+		t.Errorf("pre-existing row not searchable after rebuild: %d hits", hits)
+	}
+}
