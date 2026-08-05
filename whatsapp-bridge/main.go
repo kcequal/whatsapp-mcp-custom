@@ -123,6 +123,11 @@ func NewMessageStore() (*MessageStore, error) {
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
 
+		CREATE TABLE IF NOT EXISTS bridge_meta (
+			key TEXT PRIMARY KEY,
+			value TEXT
+		);
+
 		CREATE TABLE IF NOT EXISTS calls (
 			call_id TEXT,
 			caller_jid TEXT,
@@ -267,20 +272,37 @@ func (store *MessageStore) NormalizeExistingSenders(whatsappDBPath string, logge
 
 	changed := 0
 	for _, raw := range senders {
-		// The existing alias for this sender, if the rows agree on one.
+		// The existing alias for this sender — but only if the rows agree on one.
+		// Rows sharing a sender could carry different non-empty aliases; picking
+		// one with MAX and writing it to all of them would silently overwrite the
+		// others. In that case we correct the sender and leave each row's alias be.
+		var distinctAliases int
 		var currentLID string
 		if err := tx.QueryRow(
-			`SELECT COALESCE(MAX(sender_lid), '') FROM messages WHERE sender = ? AND COALESCE(sender_lid,'') != ''`,
-			raw).Scan(&currentLID); err != nil {
+			`SELECT COUNT(DISTINCT sender_lid), COALESCE(MIN(sender_lid), '')
+			 FROM messages WHERE sender = ? AND COALESCE(sender_lid,'') != ''`,
+			raw).Scan(&distinctAliases, &currentLID); err != nil {
 			return fmt.Errorf("failed to read current alias for %q: %w", raw, err)
+		}
+		if distinctAliases > 1 {
+			currentLID = ""
 		}
 		want, wantLID := canonicalSender(raw, currentLID, lid2pn, pn2lid)
 
-		// Update only rows that actually differ, so a repeat run touches nothing.
-		res, err := tx.Exec(
-			`UPDATE messages SET sender = ?, sender_lid = ?
-			 WHERE sender = ? AND (sender != ? OR COALESCE(sender_lid,'') != ?)`,
-			want, wantLID, raw, want, wantLID)
+		var res sql.Result
+		var err error
+		if distinctAliases > 1 && wantLID == "" {
+			// Ambiguous and unresolved: fix the identity, preserve each alias.
+			res, err = tx.Exec(
+				`UPDATE messages SET sender = ? WHERE sender = ? AND sender != ?`,
+				want, raw, want)
+		} else {
+			// Update only rows that actually differ, so a repeat run touches nothing.
+			res, err = tx.Exec(
+				`UPDATE messages SET sender = ?, sender_lid = ?
+				 WHERE sender = ? AND (sender != ? OR COALESCE(sender_lid,'') != ?)`,
+				want, wantLID, raw, want, wantLID)
+		}
 		if err != nil {
 			return fmt.Errorf("failed to normalise sender %q: %w", raw, err)
 		}
@@ -319,11 +341,24 @@ func (store *MessageStore) NormalizeExistingSenders(whatsappDBPath string, logge
 // later run once the map learns it.
 func canonicalSender(raw, currentLID string, lid2pn, pn2lid map[string]string) (string, string) {
 	bare := strings.Split(strings.Split(raw, "@")[0], ":")[0]
-	if pn, ok := lid2pn[bare]; ok {
-		return pn, bare
+	_, isLID := lid2pn[bare]
+	_, isPN := pn2lid[bare]
+
+	// The two namespaces are not provably disjoint: one account's LID could in
+	// principle equal another's phone number. (Zero overlap in the live map today,
+	// and the length ranges do not even meet — LIDs 13-15 digits, phones 11-12 —
+	// but "currently true of the data" is not an invariant.) If a bare value is
+	// claimed by both, we cannot tell which it is, so leave the row untouched
+	// rather than reassign someone's identity. An explicit "@lid" suffix below is
+	// still authoritative because it was written, not inferred.
+	if isLID && isPN {
+		return raw, currentLID
 	}
-	if lid, ok := pn2lid[bare]; ok {
-		return bare, lid
+	if isLID {
+		return lid2pn[bare], bare
+	}
+	if isPN {
+		return bare, pn2lid[bare]
 	}
 	if strings.HasSuffix(raw, "@lid") {
 		return bare + "@lid", bare
@@ -386,6 +421,32 @@ func (store *MessageStore) reconcileSearchIndex() error {
 	if !store.ftsEnabled {
 		return nil
 	}
+
+	// A document count catches missing or extra entries, but NOT an entry whose
+	// indexed terms are stale while the count is unchanged — which is exactly what
+	// years of writes without index maintenance leave behind. No cheap query can
+	// prove term-level equality, so instead take one known-good baseline: rebuild
+	// unconditionally the first time this version runs, record that, and rely on
+	// per-write maintenance from then on. Bounded (once per database), not a
+	// per-boot rebuild.
+	const baselineKey = "fts_baseline_rebuild"
+	var done string
+	err := store.db.QueryRow(`SELECT value FROM bridge_meta WHERE key = ?`, baselineKey).Scan(&done)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("failed to read search index baseline marker: %w", err)
+	}
+	if err == sql.ErrNoRows {
+		fmt.Println("Taking a one-time search index baseline (rebuilding)")
+		if _, err := store.db.Exec(`INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`); err != nil {
+			return fmt.Errorf("failed to take search index baseline: %w", err)
+		}
+		if _, err := store.db.Exec(
+			`INSERT OR REPLACE INTO bridge_meta (key, value) VALUES (?, ?)`, baselineKey, "1"); err != nil {
+			return fmt.Errorf("failed to record search index baseline: %w", err)
+		}
+		return nil
+	}
+
 	var msgCount, indexed int
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&msgCount); err != nil {
 		return fmt.Errorf("failed to count messages: %w", err)

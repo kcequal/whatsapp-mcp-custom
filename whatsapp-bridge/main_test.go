@@ -73,6 +73,8 @@ func newTestMessageStore(t *testing.T) *MessageStore {
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
 	
+		CREATE TABLE bridge_meta (key TEXT PRIMARY KEY, value TEXT);
+
 		CREATE VIRTUAL TABLE messages_fts USING fts5(
 			content, sender, chat_jid,
 			content='messages',
@@ -772,5 +774,40 @@ func TestNormalizeExistingSenders_EmptyMapStillMarksLIDs(t *testing.T) {
 	}
 	if s != "999888777666555@lid" || l != "999888777666555" {
 		t.Errorf("got (%q,%q), want (999888777666555@lid,999888777666555)", s, l)
+	}
+}
+
+// A value claimed by BOTH namespaces is ambiguous; reassigning it would change
+// whose identity a row belongs to. Leave it alone.
+func TestCanonicalSender_AmbiguousValueIsNotReassigned(t *testing.T) {
+	collide := "919948093961"
+	lid2pn := map[string]string{collide: "911111111111"} // it is someone's LID
+	pn2lid := map[string]string{collide: "222222222222"} // and someone else's phone
+	gotS, gotL := canonicalSender(collide, "existing-alias", lid2pn, pn2lid)
+	if gotS != collide || gotL != "existing-alias" {
+		t.Errorf("got (%q,%q), want the row untouched (%q,existing-alias)", gotS, gotL, collide)
+	}
+}
+
+// The baseline rebuild must happen once, not on every startup.
+func TestReconcileSearchIndex_BaselineIsTakenOnce(t *testing.T) {
+	ms := newTestMessageStore(t)
+	if _, err := ms.db.Exec(`CREATE TABLE IF NOT EXISTS bridge_meta (key TEXT PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatalf("meta: %v", err)
+	}
+	if err := ms.reconcileSearchIndex(); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	var marker string
+	if err := ms.db.QueryRow(`SELECT value FROM bridge_meta WHERE key='fts_baseline_rebuild'`).Scan(&marker); err != nil {
+		t.Fatalf("marker not recorded: %v", err)
+	}
+	// Second call must not re-baseline.
+	if err := ms.reconcileSearchIndex(); err != nil {
+		t.Fatalf("second: %v", err)
+	}
+	var n int
+	if err := ms.db.QueryRow(`SELECT COUNT(*) FROM bridge_meta`).Scan(&n); err != nil || n != 1 {
+		t.Errorf("expected exactly one marker row, got %d (err %v)", n, err)
 	}
 }
