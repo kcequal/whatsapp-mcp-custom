@@ -373,6 +373,17 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	return err
 }
 
+// TouchChat bumps a chat's last_message_time without touching its name.
+// StoreChat is INSERT OR REPLACE, so calling it from the outgoing path (where
+// we have no display name to hand) would blank an existing chat's name.
+func (store *MessageStore) TouchChat(jid string, lastMessageTime time.Time) error {
+	_, err := store.db.Exec(
+		"UPDATE chats SET last_message_time = ? WHERE jid = ? AND (last_message_time IS NULL OR last_message_time < ?)",
+		lastMessageTime, jid, lastMessageTime,
+	)
+	return err
+}
+
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
@@ -521,7 +532,7 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -754,11 +765,13 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
 	}
+
+	recordOutgoing(client, messageStore, recipientJID, resp, msg)
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
 }
@@ -883,6 +896,59 @@ func resolveLIDChat(client *whatsmeow.Client, chat, senderAlt, recipientAlt type
 
 	fmt.Printf("Warning: could not resolve LID chat %s to phone JID\n", chat)
 	return chat
+}
+
+// recordOutgoing writes a message this process just sent into the message store.
+//
+// WhatsApp never echoes a message back to the device that sent it, and
+// handleMessage is the only other writer — so without this, everything the
+// bridge sends (digests, agent replies) leaves no trace in messages.db. Only
+// messages sent from *another* device on the same account arrive as events and
+// get stored, which is why the local own-send record went silent once the
+// digest jobs moved onto this bridge's /api/send.
+//
+// It deliberately mirrors handleMessage: same content/media extraction, same
+// chat-key normalisation (DMs are keyed by phone JID even though we send to the
+// LID), so an own-send row is indistinguishable from an echoed one.
+func recordOutgoing(client *whatsmeow.Client, messageStore *MessageStore, chat types.JID, resp whatsmeow.SendResponse, msg *waProto.Message) {
+	if messageStore == nil || msg == nil || resp.ID == "" {
+		return
+	}
+
+	chatJID := resolveLIDChat(client, chat, types.JID{}, types.JID{}, true).String()
+
+	// Match the sender identity the inbound path records for our own messages:
+	// the LID user since the 2026-07-14 LID migration, the phone user before it.
+	sender := ""
+	if lid := client.Store.GetLID(); !lid.IsEmpty() {
+		sender = lid.User
+	} else if own := client.Store.GetJID(); !own.IsEmpty() {
+		sender = own.User
+	}
+
+	content := extractTextContent(msg)
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg, resp.Timestamp)
+	if content == "" && mediaType == "" {
+		return
+	}
+
+	if err := messageStore.StoreMessage(
+		resp.ID, chatJID, sender, content, resp.Timestamp, true,
+		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+	); err != nil {
+		fmt.Printf("Warning: failed to record outgoing message %s in %s: %v\n", resp.ID, chatJID, err)
+		return
+	}
+	if err := messageStore.TouchChat(chatJID, resp.Timestamp); err != nil {
+		fmt.Printf("Warning: failed to bump chat time for %s: %v\n", chatJID, err)
+	}
+
+	timestamp := resp.Timestamp.Format("2006-01-02 15:04:05")
+	if mediaType != "" {
+		fmt.Printf("[%s] → %s: [%s: %s] %s\n", timestamp, chatJID, mediaType, filename, content)
+	} else {
+		fmt.Printf("[%s] → %s: %s\n", timestamp, chatJID, content)
+	}
 }
 
 // Handle regular incoming messages with media support
@@ -1323,7 +1389,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -1599,6 +1665,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		if err != nil {
 			jsonFail(w, 500, fmt.Sprintf("send failed: %v", err)); return
 		}
+		recordOutgoing(client, messageStore, recipientJID, resp, msg)
 		// Return the message ID so the caller can later /api/edit or /api/revoke it.
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1639,9 +1706,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Text:        proto.String(content),
 			ContextInfo: ctx,
 		}}
-		if _, err := client.SendMessage(context.Background(), recipientJID, msg); err != nil {
+		resp, err := client.SendMessage(context.Background(), recipientJID, msg)
+		if err != nil {
 			jsonFail(w, 500, fmt.Sprintf("send failed: %v", err)); return
 		}
+		recordOutgoing(client, messageStore, recipientJID, resp, msg)
 		jsonOK(w, "Forwarded")
 	})
 
