@@ -68,6 +68,11 @@ type Message struct {
 // Database handler for storing message history
 type MessageStore struct {
 	db *sql.DB
+	// ftsEnabled is false when the binary was built without the sqlite_fts5 tag.
+	// Building without it has silently broken every message write before now, so
+	// we detect it once at startup, say so loudly, and degrade to "no search"
+	// rather than "no messages".
+	ftsEnabled bool
 }
 
 // Initialize message store
@@ -78,10 +83,18 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	// WAL + a busy timeout, because two goroutines write here concurrently:
+	// handleMessage on inbound events and recordOutgoing on our own sends.
+	// *sql.DB is a connection pool, not a lock, so without these one writer
+	// gets SQLITE_BUSY and the message is dropped with only a log line.
+	db, err := sql.Open("sqlite3",
+		"file:store/messages.db?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
+	// One writer at a time. SQLite allows a single writer regardless; serialising
+	// in the pool turns lock contention into a short wait instead of an error.
+	db.SetMaxOpenConns(1)
 
 	// Create tables if they don't exist
 	_, err = db.Exec(`
@@ -126,6 +139,29 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// The search index is part of the schema, not an optional extra the Python
+	// layer bolts on. StoreMessage maintains it on every write, so a database
+	// without it fails every insert.
+	ftsEnabled := true
+	if _, ftsErr := db.Exec(`
+		CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+			content, sender, chat_jid,
+			content='messages',
+			content_rowid='rowid',
+			tokenize='unicode61 remove_diacritics 2'
+		);
+	`); ftsErr != nil {
+		if strings.Contains(ftsErr.Error(), "no such module: fts5") {
+			ftsEnabled = false
+			fmt.Println("\n*** WARNING: this binary was built WITHOUT the sqlite_fts5 build tag. ***")
+			fmt.Println("*** Messages will be stored but NOT indexed for search.                ***")
+			fmt.Println("*** Rebuild with:  go build -tags sqlite_fts5                          ***")
+		} else {
+			_ = db.Close()
+			return nil, fmt.Errorf("failed to create search index: %v", ftsErr)
+		}
+	}
+
 	// Migration: sender_lid was added 2026-08-06 alongside sender normalisation.
 	// CREATE TABLE IF NOT EXISTS won't add it to an existing database, so do it
 	// here. "duplicate column name" just means we've already run.
@@ -135,7 +171,147 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to add sender_lid column: %v", alterErr)
 	}
 
-	return &MessageStore{db: db}, nil
+	return &MessageStore{db: db, ftsEnabled: ftsEnabled}, nil
+}
+
+// NormalizeExistingSenders rewrites historical `sender` values to the canonical
+// phone form and backfills `sender_lid`, using the whatsmeow LID map.
+//
+// This exists in code, not as a one-off script, because a script only fixes the
+// box it was run on. This bridge also runs on Keshav's machine, which would
+// otherwise get the new column and none of the normalisation — the same
+// per-box-fix trap that has bitten this setup before.
+//
+// Idempotent: rows already in canonical form are rewritten to themselves.
+// Rebuilds the FTS index afterwards, because `sender` is an indexed FTS column
+// and a bulk UPDATE leaves the external-content index stale.
+func (store *MessageStore) NormalizeExistingSenders(whatsappDBPath string, logger waLog.Logger) error {
+	if _, err := os.Stat(whatsappDBPath); err != nil {
+		if os.IsNotExist(err) {
+			logger.Infof("Skipping sender normalisation: %s not found", whatsappDBPath)
+			return nil
+		}
+		return fmt.Errorf("failed to stat WhatsApp DB %s: %w", whatsappDBPath, err)
+	}
+
+	// Nothing to do if every row already carries an alias — cheap guard so this
+	// doesn't rewrite the whole table on every start.
+	var pending int
+	if err := store.db.QueryRow(
+		`SELECT COUNT(*) FROM messages WHERE sender_lid IS NULL AND sender != '' AND sender NOT LIKE '%@%'`,
+	).Scan(&pending); err != nil {
+		return fmt.Errorf("failed to count un-normalised senders: %w", err)
+	}
+	if pending == 0 {
+		logger.Infof("Sender normalisation: nothing to do")
+		return nil
+	}
+
+	lid2pn := map[string]string{}
+	pn2lid := map[string]string{}
+	func() {
+		wdb, err := sql.Open("sqlite3", "file:"+whatsappDBPath+"?mode=ro")
+		if err != nil {
+			logger.Warnf("Sender normalisation: cannot open %s: %v", whatsappDBPath, err)
+			return
+		}
+		defer func() { _ = wdb.Close() }()
+		rows, err := wdb.Query("SELECT lid, pn FROM whatsmeow_lid_map")
+		if err != nil {
+			logger.Warnf("Sender normalisation: cannot read lid map: %v", err)
+			return
+		}
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var lid, pn string
+			if err := rows.Scan(&lid, &pn); err != nil {
+				continue
+			}
+			lid = strings.Split(strings.Split(lid, "@")[0], ":")[0]
+			pn = strings.Split(strings.Split(pn, "@")[0], ":")[0]
+			lid2pn[lid] = pn
+			pn2lid[pn] = lid
+		}
+	}()
+	if len(lid2pn) == 0 {
+		logger.Infof("Sender normalisation: LID map empty, skipping")
+		return nil
+	}
+
+	rows, err := store.db.Query("SELECT DISTINCT sender FROM messages WHERE sender != ''")
+	if err != nil {
+		return fmt.Errorf("failed to list senders: %w", err)
+	}
+	var raws []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err == nil {
+			raws = append(raws, s)
+		}
+	}
+	_ = rows.Close()
+
+	tx, err := store.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	changed := 0
+	for _, raw := range raws {
+		bare := strings.Split(strings.Split(raw, "@")[0], ":")[0]
+		wasLID := strings.HasSuffix(raw, "@lid")
+		var sender, senderLID string
+		switch {
+		case lid2pn[bare] != "":
+			sender, senderLID = lid2pn[bare], bare
+		case pn2lid[bare] != "":
+			sender, senderLID = bare, pn2lid[bare]
+		case wasLID:
+			sender, senderLID = bare+"@lid", bare
+		default:
+			// Unknown to the map and not marked. A LID has no country code and is
+			// longer than any phone number, so treat that shape as a LID and mark
+			// it — an unmarked LID is what gets misread as a phone number.
+			if isDigits(bare) && len(bare) > 13 {
+				sender, senderLID = bare+"@lid", bare
+			} else {
+				sender, senderLID = bare, ""
+			}
+		}
+		if sender == raw && senderLID == "" {
+			continue
+		}
+		if _, err := tx.Exec("UPDATE messages SET sender = ?, sender_lid = ? WHERE sender = ?",
+			sender, senderLID, raw); err != nil {
+			return fmt.Errorf("failed to normalise sender %q: %w", raw, err)
+		}
+		changed++
+	}
+
+	// `sender` is indexed by messages_fts, and the bulk UPDATE above bypassed it.
+	if store.ftsEnabled {
+		if _, err := tx.Exec(`INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`); err != nil {
+			return fmt.Errorf("failed to rebuild search index after normalisation: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	logger.Infof("Sender normalisation complete: %d distinct senders rewritten", changed)
+	return nil
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // MigrateLegacyLIDChatsToPhoneJIDs rewrites message/chat rows stored under
@@ -393,9 +569,16 @@ func (store *MessageStore) RenameChat(jid, name string) error {
 // StoreChat is INSERT OR REPLACE, so calling it from the outgoing path (where
 // we have no display name to hand) would blank an existing chat's name.
 func (store *MessageStore) TouchChat(jid string, lastMessageTime time.Time) error {
+	// Upsert, not UPDATE: this used to be update-only, so the first message in a
+	// brand-new conversation stored the message but created no chats row at all —
+	// and messages.chat_jid has a foreign key onto chats(jid). Inserting with an
+	// empty name is correct here; the outgoing path has no display name to offer
+	// and GetChatName treats empty as "resolve me".
 	_, err := store.db.Exec(
-		"UPDATE chats SET last_message_time = ? WHERE jid = ? AND (last_message_time IS NULL OR last_message_time < ?)",
-		lastMessageTime, jid, lastMessageTime,
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, '', ?)
+		 ON CONFLICT(jid) DO UPDATE SET last_message_time = excluded.last_message_time
+		 WHERE chats.last_message_time IS NULL OR chats.last_message_time < excluded.last_message_time`,
+		jid, lastMessageTime,
 	)
 	return err
 }
@@ -411,13 +594,72 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, senderLID, content 
 		return nil
 	}
 
-	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages
+	tx, err := store.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// messages_fts is an FTS5 external-content index over (content, sender,
+	// chat_jid) with NO triggers, so every write here has to maintain it by hand.
+	//
+	// Two traps. First, INSERT OR REPLACE deletes and reinserts, which assigns a
+	// NEW rowid — the FTS entry then points at a rowid that no longer exists and
+	// search silently rots. Second, an external-content 'delete' must be given the
+	// OLD column values, not the new ones, or the index is left corrupt. So: read
+	// the existing row, retract it from the index, UPSERT (which preserves rowid),
+	// then index the new values.
+	var oldRowID sql.NullInt64
+	var oldContent, oldSender, oldChat string
+	if store.ftsEnabled {
+		err = tx.QueryRow(
+		"SELECT rowid, content, sender, chat_jid FROM messages WHERE id = ? AND chat_jid = ?",
+			id, chatJID,
+		).Scan(&oldRowID, &oldContent, &oldSender, &oldChat)
+		if err != nil && err != sql.ErrNoRows {
+			return err
+		}
+		if oldRowID.Valid {
+			if _, err := tx.Exec(
+				`INSERT INTO messages_fts(messages_fts, rowid, content, sender, chat_jid) VALUES('delete', ?, ?, ?, ?)`,
+				oldRowID.Int64, oldContent, oldSender, oldChat,
+			); err != nil {
+				return fmt.Errorf("failed to retract old FTS entry: %w", err)
+			}
+		}
+	}
+
+	if _, err := tx.Exec(
+		`INSERT INTO messages
 		(id, chat_jid, sender, sender_lid, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id, chat_jid) DO UPDATE SET
+			sender=excluded.sender, sender_lid=excluded.sender_lid, content=excluded.content,
+			timestamp=excluded.timestamp, is_from_me=excluded.is_from_me, media_type=excluded.media_type,
+			filename=excluded.filename, url=excluded.url, media_key=excluded.media_key,
+			file_sha256=excluded.file_sha256, file_enc_sha256=excluded.file_enc_sha256,
+			file_length=excluded.file_length`,
 		id, chatJID, sender, senderLID, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
-	)
-	return err
+	); err != nil {
+		return err
+	}
+
+	if store.ftsEnabled {
+		var newRowID int64
+		if err := tx.QueryRow(
+			"SELECT rowid FROM messages WHERE id = ? AND chat_jid = ?", id, chatJID,
+		).Scan(&newRowID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO messages_fts(rowid, content, sender, chat_jid) VALUES(?, ?, ?, ?)`,
+			newRowID, content, sender, chatJID,
+		); err != nil {
+			return fmt.Errorf("failed to index message for search: %w", err)
+		}
+	}
+
+	return tx.Commit()
 }
 
 // GetOldestMessage returns the earliest known message in a chat — used as
@@ -596,7 +838,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	// For personal chats, resolve phone number JID to LID (Linked Identity).
 	// WhatsApp is migrating to LID-based addressing; messages sent to the
 	// phone JID silently fail for migrated contacts.
+	// Remember the phone form before we swap it for a LID — recordOutgoing needs
+	// it to key the chat the same way the inbound path does.
+	var recipientAlt types.JID
 	if recipientJID.Server == types.DefaultUserServer {
+		recipientAlt = recipientJID.ToNonAD()
 		ctx := context.Background()
 		lid, lidErr := client.Store.LIDs.GetLIDForPN(ctx, recipientJID)
 		if lidErr == nil && !lid.IsEmpty() {
@@ -806,7 +1052,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		return false, fmt.Sprintf("Error sending message: %v", err)
 	}
 
-	recordOutgoing(client, messageStore, recipientJID, resp, msg)
+	recordOutgoing(client, messageStore, recipientJID, recipientAlt, resp, msg)
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
 }
@@ -945,12 +1191,36 @@ func resolveLIDChat(client *whatsmeow.Client, chat, senderAlt, recipientAlt type
 // It deliberately mirrors handleMessage: same content/media extraction, same
 // chat-key normalisation (DMs are keyed by phone JID even though we send to the
 // LID), so an own-send row is indistinguishable from an echoed one.
-func recordOutgoing(client *whatsmeow.Client, messageStore *MessageStore, chat types.JID, resp whatsmeow.SendResponse, msg *waProto.Message) {
+// phoneAltOf returns the phone JID for a recipient when one is known: itself if
+// it is already a phone JID, or the mapped phone number if it is a LID. The
+// /api/reply and /api/forward handlers send to whatever JID they were given, so
+// unlike /api/send they have no pre-swap phone form to remember.
+func phoneAltOf(client *whatsmeow.Client, jid types.JID) types.JID {
+	if jid.Server == types.DefaultUserServer {
+		return jid.ToNonAD()
+	}
+	if jid.Server == types.HiddenUserServer || jid.Server == types.HostedLIDServer {
+		bare := jid.ToNonAD()
+		bare.Server = types.HiddenUserServer
+		if pn, err := client.Store.LIDs.GetPNForLID(context.Background(), bare); err == nil && !pn.IsEmpty() {
+			return pn.ToNonAD()
+		}
+	}
+	return types.JID{}
+}
+
+// recipientAlt is the phone JID the caller started from, when it had one. Sends
+// resolve a phone number to a LID before dispatch, so we usually know the phone
+// form already — and passing it here is what guarantees this row lands under the
+// same chat key handleMessage would compute. Without it, resolution depends on
+// the local LID map already being populated, and a miss files the same
+// conversation under both "<lid>@lid" and "<phone>@s.whatsapp.net".
+func recordOutgoing(client *whatsmeow.Client, messageStore *MessageStore, chat types.JID, recipientAlt types.JID, resp whatsmeow.SendResponse, msg *waProto.Message) {
 	if messageStore == nil || msg == nil || resp.ID == "" {
 		return
 	}
 
-	chatJID := resolveLIDChat(client, chat, types.JID{}, types.JID{}, true).String()
+	chatJID := resolveLIDChat(client, chat, types.JID{}, recipientAlt, true).String()
 
 	// Match the sender identity the inbound path records for our own messages:
 	// the LID user since the 2026-07-14 LID migration, the phone user before it.
@@ -1080,7 +1350,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// manual fetch that nobody did. KC's call 2026-08-06: pull everything.
 	//
 	// Set AUTO_DOWNLOAD_MEDIA=false to opt back out.
-	if mediaType != "" && os.Getenv("AUTO_DOWNLOAD_MEDIA") != "false" {
+	// Only after a successful store: autoDownloadMedia re-reads the message from
+	// the DB, so firing it when the write failed just guarantees a failed lookup.
+	if err == nil && mediaType != "" && os.Getenv("AUTO_DOWNLOAD_MEDIA") != "false" {
 		go autoDownloadMedia(client, messageStore, msg, chatJID, mediaType, filename, logger)
 	}
 
@@ -1720,7 +1992,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		if err != nil {
 			jsonFail(w, 500, fmt.Sprintf("send failed: %v", err)); return
 		}
-		recordOutgoing(client, messageStore, recipientJID, resp, msg)
+		recordOutgoing(client, messageStore, recipientJID, phoneAltOf(client, recipientJID), resp, msg)
 		// Return the message ID so the caller can later /api/edit or /api/revoke it.
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1765,7 +2037,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		if err != nil {
 			jsonFail(w, 500, fmt.Sprintf("send failed: %v", err)); return
 		}
-		recordOutgoing(client, messageStore, recipientJID, resp, msg)
+		recordOutgoing(client, messageStore, recipientJID, phoneAltOf(client, recipientJID), resp, msg)
 		jsonOK(w, "Forwarded")
 	})
 
@@ -2218,6 +2490,11 @@ func main() {
 		return
 	}
 
+	if err := messageStore.NormalizeExistingSenders("store/whatsapp.db", logger); err != nil {
+		logger.Errorf("Failed to normalise historical senders: %v", err)
+		return
+	}
+
 	// Channel to signal reconnection needs
 	reconnectChan := make(chan bool, 1)
 
@@ -2488,16 +2765,32 @@ func normalizeSender(client *whatsmeow.Client, sender types.JID) (string, string
 	}
 	ctx := context.Background()
 
-	if sender.Server == types.HiddenUserServer {
-		lidUser := sender.ToNonAD().User
-		if pn, err := client.Store.LIDs.GetPNForLID(ctx, sender.ToNonAD()); err == nil && !pn.IsEmpty() {
+	// Only person-shaped namespaces carry an identity we can normalise. A group,
+	// broadcast or newsletter JID reaching here would otherwise be stripped to a
+	// bare user and could collide with a real phone number — "status@broadcast"
+	// becoming the sender "status". Keep those whole.
+	switch sender.Server {
+	case types.GroupServer, types.BroadcastServer, types.NewsletterServer:
+		return sender.String(), ""
+	}
+
+	// hosted.lid is a LID namespace too. Checking only HiddenUserServer treated
+	// "123:8@hosted.lid" as a phone number named "123".
+	if sender.Server == types.HiddenUserServer || sender.Server == types.HostedLIDServer {
+		bare := sender.ToNonAD()
+		bare.Server = types.HiddenUserServer
+		lidUser := bare.User
+		if pn, err := client.Store.LIDs.GetPNForLID(ctx, bare); err == nil && !pn.IsEmpty() {
 			return pn.User, lidUser
 		}
 		return lidUser + "@lid", lidUser
 	}
 
-	phoneUser := sender.ToNonAD().User
-	if lid, err := client.Store.LIDs.GetLIDForPN(ctx, sender.ToNonAD()); err == nil && !lid.IsEmpty() {
+	// DefaultUserServer, and "hosted" which is the phone-side equivalent.
+	bare := sender.ToNonAD()
+	bare.Server = types.DefaultUserServer
+	phoneUser := bare.User
+	if lid, err := client.Store.LIDs.GetLIDForPN(ctx, bare); err == nil && !lid.IsEmpty() {
 		return phoneUser, lid.User
 	}
 	return phoneUser, ""
@@ -2515,8 +2808,14 @@ func isIdentifierNotName(name string, jid types.JID) bool {
 	if trimmed == jid.User || trimmed == jid.String() {
 		return true
 	}
-	// A group subject could legitimately be numeric ("2026 Planning"), so only
-	// treat a bare run of digits long enough to be a phone number or LID as an ID.
+	// Only DMs. A group can legitimately be named "1234567890" or "2026080612",
+	// and a group subject is never an identifier we invented — it comes from the
+	// server. The identifier-as-name bug only ever affected contact chats.
+	if jid.Server == types.GroupServer || jid.Server == types.BroadcastServer ||
+		jid.Server == types.NewsletterServer {
+		return false
+	}
+	// A bare run of digits long enough to be a phone number or a LID.
 	if len(trimmed) >= 10 {
 		for _, r := range trimmed {
 			if r < '0' || r > '9' {

@@ -72,12 +72,19 @@ func newTestMessageStore(t *testing.T) *MessageStore {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+	
+		CREATE VIRTUAL TABLE messages_fts USING fts5(
+			content, sender, chat_jid,
+			content='messages',
+			content_rowid='rowid',
+			tokenize='unicode61 remove_diacritics 2'
+		);
 	`)
 	if err != nil {
 		t.Fatalf("failed to create tables: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	return &MessageStore{db: db}
+	return &MessageStore{db: db, ftsEnabled: true}
 }
 
 func testLogger() waLog.Logger {
@@ -399,5 +406,147 @@ func TestMigrateLegacyLIDChatsToPhoneJIDs_AggregatesByPhoneJIDDeterministically(
 	}
 	if lastMessage != "2026-03-01T11:00:00Z" {
 		t.Fatalf("expected merged last_message_time to be max source value, got %s", lastMessage)
+	}
+}
+
+// --- Regression tests for the 2026-08-06 QA findings ---
+
+// normalizeSender must not treat a hosted-LID JID as a phone number, and must
+// never strip a non-person namespace down to a bare user ("status@broadcast"
+// becoming the sender "status", which could collide with a real identity).
+func TestNormalizeSender_JIDShapes(t *testing.T) {
+	lid := types.JID{User: "185366493536339", Server: types.HiddenUserServer}
+	pn := types.JID{User: "11234567890", Server: types.DefaultUserServer}
+	client := newTestClient(&mockLIDStore{pnByLID: map[types.JID]types.JID{lid: pn}})
+
+	cases := []struct {
+		name       string
+		in         types.JID
+		wantSender string
+		wantLID    string
+	}{
+		{"resolvable LID", lid, "11234567890", "185366493536339"},
+		{"LID with device suffix", types.JID{User: "185366493536339", Device: 8, Server: types.HiddenUserServer}, "11234567890", "185366493536339"},
+		{"hosted LID is a LID, not a phone", types.JID{User: "185366493536339", Device: 8, Server: types.HostedLIDServer}, "11234567890", "185366493536339"},
+		{"unresolvable LID keeps the @lid marker", types.JID{User: "999888777666555", Server: types.HiddenUserServer}, "999888777666555@lid", "999888777666555"},
+		{"phone passes through", pn, "11234567890", ""},
+		{"phone with device suffix", types.JID{User: "11234567890", Device: 3, Server: types.DefaultUserServer}, "11234567890", ""},
+		{"group JID keeps its namespace", types.JID{User: "120363420428178043", Server: types.GroupServer}, "120363420428178043@g.us", ""},
+		{"broadcast keeps its namespace", types.JID{User: "status", Server: types.BroadcastServer}, "status@broadcast", ""},
+		{"empty", types.EmptyJID, "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotSender, gotLID := normalizeSender(client, tc.in)
+			if gotSender != tc.wantSender {
+				t.Errorf("sender: got %q, want %q", gotSender, tc.wantSender)
+			}
+			if gotLID != tc.wantLID {
+				t.Errorf("sender_lid: got %q, want %q", gotLID, tc.wantLID)
+			}
+		})
+	}
+}
+
+// The highest-severity QA finding: recordOutgoing and handleMessage must agree on
+// the chat key, or one conversation is filed under two chat_jid values. The hard
+// case is a LID the local map cannot resolve — recordOutgoing has to fall back to
+// the phone JID the send started from, exactly as handleMessage uses RecipientAlt.
+func TestRecordOutgoing_ChatKeyMatchesInboundPath(t *testing.T) {
+	unmappedLID := types.JID{User: "777666555444333", Server: types.HiddenUserServer}
+	phone := types.JID{User: "919060899999", Server: types.DefaultUserServer}
+
+	// Empty LID store: resolution MUST come from the passed alt, not a lookup.
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	// Inbound path: whatsmeow supplies the phone form in RecipientAlt.
+	handleMessage(client, ms, buildTextMessage(
+		unmappedLID, unmappedLID, types.EmptyJID, phone, true, "inbound-side"), logger)
+
+	// Outgoing path: we send to the LID but remember the phone we started from.
+	recordOutgoing(client, ms, unmappedLID, phone,
+		whatsmeow.SendResponse{ID: "outgoing-1", Timestamp: time.Now()},
+		&waProto.Message{Conversation: proto.String("outgoing-side")})
+
+	if got := queryMessageCount(ms, phone.String()); got != 2 {
+		t.Errorf("expected both messages under %s, got %d", phone, got)
+	}
+	if got := queryMessageCount(ms, unmappedLID.String()); got != 0 {
+		t.Errorf("conversation split: %d messages filed under the LID %s", got, unmappedLID)
+	}
+}
+
+// TouchChat used to be UPDATE-only, so the first message in a new conversation
+// stored the message but created no chats row.
+func TestRecordOutgoing_CreatesChatRowForNewConversation(t *testing.T) {
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	phone := types.JID{User: "919999999999", Server: types.DefaultUserServer}
+
+	recordOutgoing(client, ms, phone, phone,
+		whatsmeow.SendResponse{ID: "first-ever", Timestamp: time.Now()},
+		&waProto.Message{Conversation: proto.String("first message to this contact")})
+
+	if _, found := queryChat(ms, phone.String()); !found {
+		t.Errorf("no chats row created for a brand-new conversation %s", phone)
+	}
+	if got := queryMessageCount(ms, phone.String()); got != 1 {
+		t.Errorf("expected 1 message, got %d", got)
+	}
+}
+
+// StoreMessage maintains the FTS5 external-content index by hand. Re-storing the
+// same message (a retry, or history sync overlapping live delivery) must leave
+// search working rather than pointing at a stale rowid.
+func TestStoreMessage_SearchIndexSurvivesRestore(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chat := "919060899999@s.whatsapp.net"
+	if err := ms.TouchChat(chat, time.Now()); err != nil {
+		t.Fatalf("TouchChat: %v", err)
+	}
+	if err := ms.StoreMessage("m1", chat, "919060899999", "811", "vendor update coralogix",
+		time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+		t.Fatalf("first store: %v", err)
+	}
+	if err := ms.StoreMessage("m1", chat, "919060899999", "811", "vendor update inworld",
+		time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+		t.Fatalf("re-store: %v", err)
+	}
+
+	var n int
+	if err := ms.db.QueryRow(
+		`SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'inworld'`).Scan(&n); err != nil {
+		t.Fatalf("fts query: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected the updated text to be searchable exactly once, got %d", n)
+	}
+	if err := ms.db.QueryRow(
+		`SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'coralogix'`).Scan(&n); err != nil {
+		t.Fatalf("fts query: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("stale text still searchable after update: %d hits", n)
+	}
+}
+
+// A group legitimately named with digits must keep its name.
+func TestIsIdentifierNotName_GroupNamesKept(t *testing.T) {
+	group := types.JID{User: "120363420428178043", Server: types.GroupServer}
+	dm := types.JID{User: "919060899999", Server: types.DefaultUserServer}
+
+	if isIdentifierNotName("1234567890", group) {
+		t.Error("a numeric group subject should be kept")
+	}
+	if isIdentifierNotName("AD - KR - RR - KC - AK", group) {
+		t.Error("a normal group subject should be kept")
+	}
+	if !isIdentifierNotName("81141293912122", dm) {
+		t.Error("a LID stored as a DM contact name should be rejected")
+	}
+	if isIdentifierNotName("Keshav", dm) {
+		t.Error("a real contact name should be kept")
 	}
 }
