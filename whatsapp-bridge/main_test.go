@@ -568,7 +568,7 @@ func TestCanonicalSender_DoesNotGuessLongNumbers(t *testing.T) {
 		{"12345678901234", "12345678901234", ""},                   // 14 digits, unknown: leave alone
 	}
 	for _, c := range cases {
-		gotS, gotL := canonicalSender(c.raw, lid2pn, pn2lid)
+		gotS, gotL := canonicalSender(c.raw, "", lid2pn, pn2lid)
 		if gotS != c.wantSender || gotL != c.wantLID {
 			t.Errorf("canonicalSender(%q) = (%q,%q), want (%q,%q)", c.raw, gotS, gotL, c.wantSender, c.wantLID)
 		}
@@ -668,5 +668,109 @@ func TestNewMessageStore_ReconcilesStaleSearchIndex(t *testing.T) {
 	}
 	if hits != 1 {
 		t.Errorf("pre-existing row not searchable after rebuild: %d hits", hits)
+	}
+}
+
+// --- Round-3 regression tests ---
+
+// canonicalSender must never erase an alias an earlier, better-informed run
+// already worked out. Returning "" for an unknown sender wiped sender_lid.
+func TestCanonicalSender_PreservesExistingAlias(t *testing.T) {
+	empty := map[string]string{}
+	gotS, gotL := canonicalSender("12345678901234", "999888777666555", empty, empty)
+	if gotS != "12345678901234" || gotL != "999888777666555" {
+		t.Errorf("got (%q,%q), want the row left intact (12345678901234,999888777666555)", gotS, gotL)
+	}
+}
+
+// One sender must be updated once. Grouping by (sender, sender_lid) produced
+// several changes for the same sender whose UPDATEs overwrote each other.
+func TestNormalizeExistingSenders_SenderWithMixedAliases(t *testing.T) {
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+	dir := t.TempDir()
+	wa := filepath.Join(dir, "whatsapp.db")
+	wdb, err := sql.Open("sqlite3", wa)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := wdb.Exec(`CREATE TABLE whatsmeow_lid_map (lid TEXT PRIMARY KEY, pn TEXT UNIQUE NOT NULL);
+		INSERT INTO whatsmeow_lid_map VALUES ('185366493536339','11234567890');`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	_ = wdb.Close()
+
+	chat := "11234567890@s.whatsapp.net"
+	if err := ms.TouchChat(chat, time.Now()); err != nil {
+		t.Fatalf("TouchChat: %v", err)
+	}
+	// Same sender, two different stored aliases — the state the old grouping broke on.
+	for i, alias := range []string{"", "185366493536339"} {
+		if _, err := ms.db.Exec(
+			`INSERT INTO messages (id, chat_jid, sender, sender_lid, content, timestamp, is_from_me)
+			 VALUES (?,?,?,?,?,?,0)`,
+			[]string{"a", "b"}[i], chat, "185366493536339", alias, "hi", time.Now()); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	if err := ms.NormalizeExistingSenders(wa, logger); err != nil {
+		t.Fatalf("normalise: %v", err)
+	}
+	rows, err := ms.db.Query(`SELECT sender, COALESCE(sender_lid,'') FROM messages ORDER BY id`)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	n := 0
+	for rows.Next() {
+		var s, l string
+		if err := rows.Scan(&s, &l); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if s != "11234567890" || l != "185366493536339" {
+			t.Errorf("row %d: got (%q,%q), want (11234567890,185366493536339)", n, s, l)
+		}
+		n++
+	}
+	if n != 2 {
+		t.Errorf("expected 2 rows, got %d", n)
+	}
+}
+
+// With no LID map at all there is still map-independent work: an unresolved LID
+// must keep its explicit "@lid" marker so it cannot be misread as a phone number.
+func TestNormalizeExistingSenders_EmptyMapStillMarksLIDs(t *testing.T) {
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+	dir := t.TempDir()
+	wa := filepath.Join(dir, "whatsapp.db")
+	wdb, err := sql.Open("sqlite3", wa)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := wdb.Exec(`CREATE TABLE whatsmeow_lid_map (lid TEXT PRIMARY KEY, pn TEXT UNIQUE NOT NULL);`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	_ = wdb.Close()
+
+	chat := "11234567890@s.whatsapp.net"
+	if err := ms.TouchChat(chat, time.Now()); err != nil {
+		t.Fatalf("TouchChat: %v", err)
+	}
+	if _, err := ms.db.Exec(
+		`INSERT INTO messages (id, chat_jid, sender, sender_lid, content, timestamp, is_from_me)
+		 VALUES ('x',?, '999888777666555@lid', '', 'hi', ?, 0)`, chat, time.Now()); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := ms.NormalizeExistingSenders(wa, logger); err != nil {
+		t.Fatalf("normalise: %v", err)
+	}
+	var s, l string
+	if err := ms.db.QueryRow(`SELECT sender, COALESCE(sender_lid,'') FROM messages WHERE id='x'`).Scan(&s, &l); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if s != "999888777666555@lid" || l != "999888777666555" {
+		t.Errorf("got (%q,%q), want (999888777666555@lid,999888777666555)", s, l)
 	}
 }

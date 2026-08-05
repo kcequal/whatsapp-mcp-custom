@@ -148,7 +148,7 @@ func NewMessageStore() (*MessageStore, error) {
 	// without -tags sqlite_fts5 would pass this check and then fail every single
 	// write inside StoreMessage. A throwaway temp table is an honest probe.
 	ftsEnabled := true
-	if _, probeErr := db.Exec(`CREATE VIRTUAL TABLE temp.fts5_probe USING fts5(x)`); probeErr != nil {
+	if _, probeErr := db.Exec(`CREATE VIRTUAL TABLE temp.kcbridge_fts5_probe USING fts5(x)`); probeErr != nil {
 		if strings.Contains(probeErr.Error(), "no such module: fts5") {
 			ftsEnabled = false
 			fmt.Println("*** WARNING: built WITHOUT the sqlite_fts5 build tag.        ***")
@@ -158,8 +158,9 @@ func NewMessageStore() (*MessageStore, error) {
 			_ = db.Close()
 			return nil, fmt.Errorf("failed to probe FTS5 support: %v", probeErr)
 		}
-	} else {
-		_, _ = db.Exec(`DROP TABLE temp.fts5_probe`)
+	} else if _, dropErr := db.Exec(`DROP TABLE temp.kcbridge_fts5_probe`); dropErr != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to drop FTS5 probe table: %v", dropErr)
 	}
 
 	if ftsEnabled {
@@ -221,29 +222,40 @@ func (store *MessageStore) NormalizeExistingSenders(whatsappDBPath string, logge
 	if err != nil {
 		return fmt.Errorf("sender normalisation aborted, LID map unreadable: %w", err)
 	}
-	if len(lid2pn) == 0 {
-		logger.Infof("Sender normalisation: LID map empty, skipping")
-		return nil
-	}
+	// Deliberately no early return on an empty map: marking an unresolved LID
+	// with its "@lid" suffix is map-independent work that still needs doing.
 
+	// Everything below runs inside ONE transaction: enumerate, decide, update,
+	// reindex. Enumerating outside it would let a sender that appears in between
+	// be silently skipped while the run still reports success. (No writer is
+	// running at this point in startup, but correctness should not depend on
+	// that staying true.)
+	//
 	// No pre-count guard. The previous one tested `sender_lid IS NULL` while this
-	// function writes '', so completed rows looked pending forever and pending
-	// rows looked done. Enumerating distinct senders is cheap (hundreds of rows,
-	// not millions) and comparing against what is actually stored is exact.
-	type current struct{ sender, senderLID string }
-	rows, err := store.db.Query(
-		`SELECT sender, COALESCE(sender_lid, '') FROM messages WHERE sender != '' GROUP BY sender, COALESCE(sender_lid, '')`)
+	// function writes '', so completed rows looked pending and pending rows looked
+	// done. Comparing desired against stored is exact, and the sender set is
+	// hundreds of rows, not millions.
+	tx, err := store.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Group by sender alone: the desired pair is a function of the sender string,
+	// so grouping by (sender, sender_lid) produced several changes for one sender
+	// whose UPDATEs then overwrote each other.
+	rows, err := tx.Query(`SELECT DISTINCT sender FROM messages WHERE sender != ''`)
 	if err != nil {
 		return fmt.Errorf("failed to list senders: %w", err)
 	}
-	var existing []current
+	var senders []string
 	for rows.Next() {
-		var c current
-		if err := rows.Scan(&c.sender, &c.senderLID); err != nil {
+		var s string
+		if err := rows.Scan(&s); err != nil {
 			_ = rows.Close()
 			return fmt.Errorf("failed to read sender row: %w", err)
 		}
-		existing = append(existing, c)
+		senders = append(senders, s)
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
@@ -253,37 +265,38 @@ func (store *MessageStore) NormalizeExistingSenders(whatsappDBPath string, logge
 		return fmt.Errorf("failed to close sender query: %w", err)
 	}
 
-	// Work out what changes before opening the write transaction.
-	type change struct{ fromSender, toSender, toLID string }
-	var changes []change
-	for _, c := range existing {
-		s, l := canonicalSender(c.sender, lid2pn, pn2lid)
-		if s == c.sender && l == c.senderLID {
-			continue
+	changed := 0
+	for _, raw := range senders {
+		// The existing alias for this sender, if the rows agree on one.
+		var currentLID string
+		if err := tx.QueryRow(
+			`SELECT COALESCE(MAX(sender_lid), '') FROM messages WHERE sender = ? AND COALESCE(sender_lid,'') != ''`,
+			raw).Scan(&currentLID); err != nil {
+			return fmt.Errorf("failed to read current alias for %q: %w", raw, err)
 		}
-		changes = append(changes, change{c.sender, s, l})
+		want, wantLID := canonicalSender(raw, currentLID, lid2pn, pn2lid)
+
+		// Update only rows that actually differ, so a repeat run touches nothing.
+		res, err := tx.Exec(
+			`UPDATE messages SET sender = ?, sender_lid = ?
+			 WHERE sender = ? AND (sender != ? OR COALESCE(sender_lid,'') != ?)`,
+			want, wantLID, raw, want, wantLID)
+		if err != nil {
+			return fmt.Errorf("failed to normalise sender %q: %w", raw, err)
+		}
+		if n, err := res.RowsAffected(); err == nil && n > 0 {
+			changed++
+		}
 	}
-	if len(changes) == 0 {
+
+	if changed == 0 {
 		logger.Infof("Sender normalisation: already canonical")
-		return nil
+		return tx.Commit()
 	}
 
-	tx, err := store.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	for _, ch := range changes {
-		if _, err := tx.Exec("UPDATE messages SET sender = ?, sender_lid = ? WHERE sender = ?",
-			ch.toSender, ch.toLID, ch.fromSender); err != nil {
-			return fmt.Errorf("failed to normalise sender %q: %w", ch.fromSender, err)
-		}
-	}
-
-	// `sender` is an indexed FTS column and the bulk UPDATE above bypassed the
-	// index, so rebuild in the same transaction: it sees these updates, and a
-	// failure rolls the whole thing back.
+	// `sender` is an indexed FTS column and the UPDATEs above bypassed the index,
+	// so rebuild in the same transaction: it sees these updates, and a failure
+	// rolls everything back together.
 	if store.ftsEnabled {
 		if _, err := tx.Exec(`INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`); err != nil {
 			return fmt.Errorf("failed to rebuild search index after normalisation: %w", err)
@@ -292,7 +305,7 @@ func (store *MessageStore) NormalizeExistingSenders(whatsappDBPath string, logge
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	logger.Infof("Sender normalisation complete: %d distinct senders rewritten", len(changes))
+	logger.Infof("Sender normalisation complete: %d distinct senders rewritten", changed)
 	return nil
 }
 
@@ -304,7 +317,7 @@ func (store *MessageStore) NormalizeExistingSenders(whatsappDBPath string, logge
 // phone number would have been permanently relabelled. An unmarked value that
 // the map does not know stays exactly as it is, and gets another chance on a
 // later run once the map learns it.
-func canonicalSender(raw string, lid2pn, pn2lid map[string]string) (string, string) {
+func canonicalSender(raw, currentLID string, lid2pn, pn2lid map[string]string) (string, string) {
 	bare := strings.Split(strings.Split(raw, "@")[0], ":")[0]
 	if pn, ok := lid2pn[bare]; ok {
 		return pn, bare
@@ -315,7 +328,10 @@ func canonicalSender(raw string, lid2pn, pn2lid map[string]string) (string, stri
 	if strings.HasSuffix(raw, "@lid") {
 		return bare + "@lid", bare
 	}
-	return raw, ""
+	// Nothing authoritative. Leave the row exactly as it is — returning an empty
+	// alias here would ERASE a sender_lid that an earlier, better-informed run
+	// had already worked out.
+	return raw, currentLID
 }
 
 // loadLIDMap reads the whole whatsmeow LID/phone mapping, or fails.
@@ -347,6 +363,9 @@ func loadLIDMap(whatsappDBPath string) (lid2pn, pn2lid map[string]string, err er
 	if err := rows.Err(); err != nil {
 		return nil, nil, err
 	}
+	if err := rows.Close(); err != nil {
+		return nil, nil, err
+	}
 	return lid2pn, pn2lid, nil
 }
 
@@ -372,9 +391,13 @@ func (store *MessageStore) reconcileSearchIndex() error {
 		return fmt.Errorf("failed to count messages: %w", err)
 	}
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM messages_fts_docsize`).Scan(&indexed); err != nil {
-		// Older index layouts may not expose the shadow table; rebuilding is the
-		// safe response to not knowing.
-		indexed = -1
+		// An index built with columnsize=0 has no docsize shadow table, and a
+		// rebuild will not create one — so treating "cannot tell" as "rebuild"
+		// would rebuild the whole index on every single startup forever. Say so
+		// once and leave the index alone; degraded search beats a boot-time
+		// rebuild loop.
+		fmt.Printf("Cannot determine search index freshness (%v); skipping reconciliation\n", err)
+		return nil
 	}
 	if indexed == msgCount {
 		return nil
@@ -601,6 +624,21 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 	}
 	if _, err := tx.Exec("DROP TABLE IF EXISTS tmp_lid_chat_candidates;"); err != nil {
 		return fmt.Errorf("failed to clean temporary chat candidate table: %w", err)
+	}
+
+	// This migration DELETEs and re-INSERTs message rows, which changes their
+	// rowids and rewrites chat_jid — both indexed by messages_fts, which has no
+	// triggers. Rebuild inside the same transaction, or the search index is left
+	// pointing at rowids that no longer exist.
+	//
+	// A count-based freshness check cannot catch this: N rows deleted and N
+	// reinserted leaves the document count identical while every entry is stale.
+	// So the rebuild has to be unconditional whenever this migration changed
+	// anything, not deferred to reconcileSearchIndex.
+	if store.ftsEnabled && (insertedMessages > 0 || deletedMessages > 0 || deletedChats > 0) {
+		if _, err := tx.Exec(`INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`); err != nil {
+			return fmt.Errorf("failed to rebuild search index after LID chat migration: %w", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
