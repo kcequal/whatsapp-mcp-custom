@@ -341,16 +341,29 @@ func (store *MessageStore) NormalizeExistingSenders(whatsappDBPath string, logge
 // later run once the map learns it.
 func canonicalSender(raw, currentLID string, lid2pn, pn2lid map[string]string) (string, string) {
 	bare := strings.Split(strings.Split(raw, "@")[0], ":")[0]
+
+	// An explicit "@lid" suffix settles the namespace before any inference does.
+	// It was WRITTEN by this code, not guessed, so it outranks map membership --
+	// which is only ever evidence. Checking the maps first meant a value carrying
+	// "@lid" that also happened to be somebody's phone number got reassigned as a
+	// phone, and a value present in both directions stayed unresolved even though
+	// its suffix already said what it was.
+	if strings.HasSuffix(raw, "@lid") {
+		if pn, ok := lid2pn[bare]; ok {
+			return pn, bare
+		}
+		return bare + "@lid", bare
+	}
+
 	_, isLID := lid2pn[bare]
 	_, isPN := pn2lid[bare]
 
-	// The two namespaces are not provably disjoint: one account's LID could in
-	// principle equal another's phone number. (Zero overlap in the live map today,
-	// and the length ranges do not even meet — LIDs 13-15 digits, phones 11-12 —
-	// but "currently true of the data" is not an invariant.) If a bare value is
-	// claimed by both, we cannot tell which it is, so leave the row untouched
-	// rather than reassign someone's identity. An explicit "@lid" suffix below is
-	// still authoritative because it was written, not inferred.
+	// Unmarked, and the two namespaces are not provably disjoint: one account's
+	// LID could in principle equal another's phone number. (Zero overlap in the
+	// live map today, and the length ranges do not even meet -- LIDs 13-15 digits,
+	// phones 11-12 -- but "currently true of the data" is not an invariant.) If
+	// both claim it we cannot tell, so leave the row rather than reassign an
+	// identity.
 	if isLID && isPN {
 		return raw, currentLID
 	}
@@ -360,9 +373,7 @@ func canonicalSender(raw, currentLID string, lid2pn, pn2lid map[string]string) (
 	if isPN {
 		return bare, pn2lid[bare]
 	}
-	if strings.HasSuffix(raw, "@lid") {
-		return bare + "@lid", bare
-	}
+
 	// Nothing authoritative. Leave the row exactly as it is — returning an empty
 	// alias here would ERASE a sender_lid that an earlier, better-informed run
 	// had already worked out.

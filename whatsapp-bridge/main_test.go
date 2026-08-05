@@ -811,3 +811,23 @@ func TestReconcileSearchIndex_BaselineIsTakenOnce(t *testing.T) {
 		t.Errorf("expected exactly one marker row, got %d (err %v)", n, err)
 	}
 }
+
+// An explicit "@lid" suffix was written by this code, not inferred, so it must
+// outrank map membership. Checking the maps first reassigned a suffixed LID as a
+// phone number whenever those digits were also somebody's phone.
+func TestCanonicalSender_ExplicitSuffixBeatsInference(t *testing.T) {
+	value := "919948093961"
+
+	// (a) suffixed, and the same digits are somebody else's phone number.
+	gotS, gotL := canonicalSender(value+"@lid", "", map[string]string{}, map[string]string{value: "777"})
+	if gotS != value+"@lid" || gotL != value {
+		t.Errorf("suffixed + phone collision: got (%q,%q), want (%s@lid,%s)", gotS, gotL, value, value)
+	}
+
+	// (b) suffixed and present in both directions: the suffix disambiguates it.
+	gotS, gotL = canonicalSender(value+"@lid", "",
+		map[string]string{value: "911111111111"}, map[string]string{value: "222222222222"})
+	if gotS != "911111111111" || gotL != value {
+		t.Errorf("suffixed + ambiguous: got (%q,%q), want (911111111111,%s)", gotS, gotL, value)
+	}
+}
