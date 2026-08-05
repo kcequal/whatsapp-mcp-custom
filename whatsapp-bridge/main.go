@@ -95,6 +95,7 @@ func NewMessageStore() (*MessageStore, error) {
 			id TEXT,
 			chat_jid TEXT,
 			sender TEXT,
+			sender_lid TEXT,
 			content TEXT,
 			timestamp TIMESTAMP,
 			is_from_me BOOLEAN,
@@ -123,6 +124,15 @@ func NewMessageStore() (*MessageStore, error) {
 	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
+	}
+
+	// Migration: sender_lid was added 2026-08-06 alongside sender normalisation.
+	// CREATE TABLE IF NOT EXISTS won't add it to an existing database, so do it
+	// here. "duplicate column name" just means we've already run.
+	if _, alterErr := db.Exec(`ALTER TABLE messages ADD COLUMN sender_lid TEXT`); alterErr != nil &&
+		!strings.Contains(alterErr.Error(), "duplicate column name") {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to add sender_lid column: %v", alterErr)
 	}
 
 	return &MessageStore{db: db}, nil
@@ -390,8 +400,11 @@ func (store *MessageStore) TouchChat(jid string, lastMessageTime time.Time) erro
 	return err
 }
 
-// Store a message in the database
-func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
+// Store a message in the database.
+// sender is the canonical identity (phone number where known); senderLID is the
+// LID alias, kept because some contacts only ever appear as a LID. See
+// normalizeSender for how the pair is derived.
+func (store *MessageStore) StoreMessage(id, chatJID, sender, senderLID, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
@@ -399,10 +412,10 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 	}
 
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		`INSERT OR REPLACE INTO messages
+		(id, chat_jid, sender, sender_lid, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, sender, senderLID, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
 	return err
 }
@@ -941,11 +954,19 @@ func recordOutgoing(client *whatsmeow.Client, messageStore *MessageStore, chat t
 
 	// Match the sender identity the inbound path records for our own messages:
 	// the LID user since the 2026-07-14 LID migration, the phone user before it.
-	sender := ""
+	// Our own identity, normalised the same way every other sender is: phone
+	// number canonical, LID as the alias.
+	sender, senderLID := "", ""
+	if own := client.Store.GetJID(); !own.IsEmpty() {
+		sender, senderLID = normalizeSender(client, own)
+	}
 	if lid := client.Store.GetLID(); !lid.IsEmpty() {
-		sender = lid.User
-	} else if own := client.Store.GetJID(); !own.IsEmpty() {
-		sender = own.User
+		if senderLID == "" {
+			senderLID = lid.ToNonAD().User
+		}
+		if sender == "" {
+			sender = lid.ToNonAD().User + "@lid"
+		}
 	}
 
 	content := extractTextContent(msg)
@@ -955,7 +976,7 @@ func recordOutgoing(client *whatsmeow.Client, messageStore *MessageStore, chat t
 	}
 
 	if err := messageStore.StoreMessage(
-		resp.ID, chatJID, sender, content, resp.Timestamp, true,
+		resp.ID, chatJID, sender, senderLID, content, resp.Timestamp, true,
 		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	); err != nil {
 		fmt.Printf("Warning: failed to record outgoing message %s in %s: %v\n", resp.ID, chatJID, err)
@@ -979,7 +1000,19 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// and outgoing messages land in the same chat entry.
 	resolvedChat := resolveLIDChat(client, msg.Info.Chat, msg.Info.SenderAlt, msg.Info.RecipientAlt, msg.Info.IsFromMe)
 	chatJID := resolvedChat.String()
-	sender := msg.Info.Sender.User
+
+	// Prefer the phone JID the message already carries (SenderAlt on LID-addressed
+	// messages) over a store lookup — it is authoritative and always present on
+	// live messages. Fall back to the LID map for history sync, where it is empty.
+	senderJID := msg.Info.Sender
+	if senderJID.Server == types.HiddenUserServer && !msg.Info.SenderAlt.IsEmpty() &&
+		msg.Info.SenderAlt.Server == types.DefaultUserServer {
+		senderJID = msg.Info.SenderAlt
+	}
+	sender, senderLID := normalizeSender(client, senderJID)
+	if senderLID == "" && msg.Info.Sender.Server == types.HiddenUserServer {
+		senderLID = msg.Info.Sender.ToNonAD().User
+	}
 
 	// Get appropriate chat name (pass resolved JID so contact lookup works)
 	name := GetChatName(client, messageStore, resolvedChat, chatJID, nil, sender, logger)
@@ -1025,6 +1058,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		msg.Info.ID,
 		chatJID,
 		sender,
+		senderLID,
 		content,
 		msg.Info.Timestamp,
 		msg.Info.IsFromMe,
@@ -2427,6 +2461,48 @@ connectionSuccess:
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info
+// normalizeSender converts a message's sender JID into the pair we store:
+// a canonical identity and its LID alias.
+//
+// WhatsApp is migrating to LID addressing — this account migrated 2026-07-14 —
+// so the same person arrives as a phone number before the switch and as a LID
+// after it. The sender column had accumulated three spellings as a result
+// (bare digits that could be either, and LIDs with an "@lid" suffix), which
+// meant `147609603813461` and `147609603813461@lid` were the same person and
+// no query matched both.
+//
+// The phone number is the canonical form because it is the only identifier that
+// joins WhatsApp to email, Slack and the contact book. A LID means nothing
+// outside WhatsApp.
+//
+// Returns (sender, senderLID):
+//   - resolvable LID  → ("919499499994", "147609603813461")
+//   - phone JID       → ("919499499994", "147609603813461") when the reverse
+//     mapping is known, else ("919499499994", "")
+//   - unresolvable LID → ("147609603813461@lid", "147609603813461") — the suffix
+//     is deliberate, so an unresolved LID can never be misread as a phone number.
+//     That confusion is what caused a whole session to mistake KC for his own bot.
+func normalizeSender(client *whatsmeow.Client, sender types.JID) (string, string) {
+	if sender.IsEmpty() {
+		return "", ""
+	}
+	ctx := context.Background()
+
+	if sender.Server == types.HiddenUserServer {
+		lidUser := sender.ToNonAD().User
+		if pn, err := client.Store.LIDs.GetPNForLID(ctx, sender.ToNonAD()); err == nil && !pn.IsEmpty() {
+			return pn.User, lidUser
+		}
+		return lidUser + "@lid", lidUser
+	}
+
+	phoneUser := sender.ToNonAD().User
+	if lid, err := client.Store.LIDs.GetLIDForPN(ctx, sender.ToNonAD()); err == nil && !lid.IsEmpty() {
+		return phoneUser, lid.User
+	}
+	return phoneUser, ""
+}
+
 // isIdentifierNotName reports whether a stored chat "name" is really just an
 // identifier wearing a name's clothes — an all-digit string (a phone number or a
 // LID), or the chat's own JID user. These are the values that make a failed
@@ -2651,6 +2727,17 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					sender = jid.User
 				}
 
+				// History sync hands back raw JID strings (a bare user, or a full
+				// "…@lid" / "…@s.whatsapp.net"). Put them through the same
+				// normalisation as live messages so a person has one identity
+				// regardless of which path stored them.
+				senderLID := ""
+				if parsed, parseErr := types.ParseJID(sender); parseErr == nil && !parsed.IsEmpty() {
+					sender, senderLID = normalizeSender(client, parsed)
+				} else if parsed, parseErr := types.ParseJID(sender + "@s.whatsapp.net"); parseErr == nil {
+					sender, senderLID = normalizeSender(client, parsed)
+				}
+
 				// Store message
 				msgID := ""
 				if msg.Message.Key != nil && msg.Message.Key.ID != nil {
@@ -2668,6 +2755,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					msgID,
 					chatJID,
 					sender,
+					senderLID,
 					content,
 					msgTimestamp,
 					isFromMe,
