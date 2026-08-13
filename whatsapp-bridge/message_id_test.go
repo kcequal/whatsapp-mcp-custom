@@ -1,15 +1,23 @@
 package main
 
-// Step 1 of the one-send-path v3 rollout (LLD §7, LLD §8 test 4).
+// Step 1 of the one-send-path v3 rollout (LLD §7).
+//
+// This is a PREREQUISITE for LLD §8 test 4, not that test. Test 4 asserts
+// Buddy's reply says "handed over" and not "delivered"; that is a Buddy-side
+// assertion in a later step. What the bridge owes it is the ability to report
+// "accepted, and here is the handle" separately from "accepted, no handle" —
+// which is what these tests pin.
 //
 // WHY THESE TESTS EXIST. The ledger on the Buddy side already has a
 // message_id column and contact_broker.py already reads "message_id" off the
 // bridge's /api/send response — but the bridge never sends one. So every row
 // records a NULL id, and "the bridge said success" is the only evidence a send
 // ever happened. That is exactly the "accepted != delivered" confusion this
-// step closes: without the provider's own id, Buddy cannot distinguish a
-// message WhatsApp accepted and gave a handle for from one it merely did not
-// error on.
+// step closes: without the id the send is filed under, Buddy cannot
+// distinguish a message WhatsApp accepted and handed back a usable handle for
+// from one it merely did not error on. (The id is client-generated, not minted
+// by WhatsApp — see SendMessageResponse.MessageID. What it proves is that this
+// send has a handle at all, which is the thing the ledger currently lacks.)
 //
 // The first two tests are REFLECTION tests on purpose. A test that referred to
 // the new field or the new third return value directly would fail to COMPILE
@@ -20,9 +28,12 @@ package main
 
 import (
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -93,7 +104,7 @@ func postSend(t *testing.T, send sendFunc, body string) (int, map[string]any, st
 	return rec.Code, decoded, raw
 }
 
-// The id WhatsApp gave us must arrive at the caller, unaltered, under
+// The id the send was filed under must arrive at the caller, unaltered, under
 // "message_id" — the key contact_broker.py already reads.
 func TestSendHandler_EmitsProviderMessageID(t *testing.T) {
 	const providerID = "3EB0C767D26B8FA1B2C3"
@@ -114,10 +125,10 @@ func TestSendHandler_EmitsProviderMessageID(t *testing.T) {
 	}
 }
 
-// LLD 8 test 4 — ACCEPTED IS NOT DELIVERED. The bridge can report success
-// without an id (WhatsApp returned no handle). The caller must be able to see
+// PREREQUISITE FOR LLD §8 test 4 — ACCEPTED IS NOT DELIVERED. The bridge can
+// report success without an id. The caller must be able to see
 // that: the key is ABSENT, not present-and-empty, so "handed over" cannot be
-// mistaken for "delivered with a handle".
+// mistaken for "accepted with a handle".
 func TestSendHandler_AcceptedWithoutIDOmitsTheKey(t *testing.T) {
 	code, got, raw := postSend(t, func(recipient, message, mediaPath string) (bool, string, string) {
 		return true, "Message sent to 919999999999", ""
@@ -212,57 +223,131 @@ func TestSendHandler_MediaOnlySendStillCarriesTheID(t *testing.T) {
 	}
 }
 
-// NO FABRICATED HANDLES. Every failure path out of sendWhatsAppMessage must
-// return an empty message id. An id attached to a send that did not happen is
-// a handle for a message that does not exist — the ledger would then hold
-// evidence of a delivery nobody made, which is the exact failure this whole
-// project exists to kill.
+// THE RETURN CONTRACT OF sendWhatsAppMessage, both directions.
 //
-// This is a SOURCE-level test because the failure paths need a live whatsmeow
-// client to reach at runtime. It is not a substitute for a behavioural test;
-// it is the strongest guard available for a path that cannot be driven here,
-// and it does catch the mutation "return an id on failure".
-func TestSendWhatsAppMessage_NoFailurePathReturnsAnID(t *testing.T) {
-	src, err := os.ReadFile("main.go")
+//   - every FAILURE return carries an empty id — an id attached to a send that
+//     did not happen is a handle for a message that does not exist, and the
+//     ledger would then hold evidence of a send nobody made;
+//   - the SUCCESS return carries the id bound by client.SendMessage, not a
+//     constant, not "" — otherwise the ledger goes back to recording nothing
+//     and this whole step is a no-op that still passes its wire tests.
+//
+// This is a SOURCE-level (AST) test because sendWhatsAppMessage needs a
+// logged-in whatsmeow client to drive at runtime: there is no seam to inject
+// one without rewriting media upload, the message store and the client call
+// itself, which is out of scope for step 1. It is not a substitute for a
+// behavioural test — the id actually arriving from WhatsApp is unproven until
+// a live send is watched. It is the strongest guard available here, and it is
+// pinned to the identifier assigned by client.SendMessage rather than to
+// source text, so reformatting cannot silently disarm it.
+func TestSendWhatsAppMessage_ReturnContract(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "main.go", nil, 0)
 	if err != nil {
-		t.Fatalf("reading main.go: %v", err)
+		t.Fatalf("parsing main.go: %v", err)
 	}
-	lines := strings.Split(string(src), "\n")
 
-	start := -1
-	for i, line := range lines {
-		if strings.HasPrefix(line, "func sendWhatsAppMessage(") {
-			start = i
+	var fn *ast.FuncDecl
+	for _, decl := range file.Decls {
+		if d, ok := decl.(*ast.FuncDecl); ok && d.Name.Name == "sendWhatsAppMessage" && d.Recv == nil {
+			fn = d
 			break
 		}
 	}
-	if start < 0 {
-		t.Fatal("could not find sendWhatsAppMessage in main.go")
-	}
-	end := -1
-	for i := start + 1; i < len(lines); i++ {
-		if lines[i] == "}" {
-			end = i
-			break
-		}
-	}
-	if end < 0 {
-		t.Fatal("could not find the end of sendWhatsAppMessage")
+	if fn == nil {
+		t.Fatal("could not find func sendWhatsAppMessage in main.go")
 	}
 
-	failures := 0
-	for i := start; i < end; i++ {
-		trimmed := strings.TrimSpace(lines[i])
-		if !strings.HasPrefix(trimmed, "return false,") {
-			continue
+	// The name client.SendMessage binds its response to. The success return
+	// must hand back THAT value's .ID and nothing else.
+	respName := ""
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok || len(assign.Rhs) != 1 || len(assign.Lhs) == 0 {
+			return true
 		}
-		failures++
-		if !strings.HasSuffix(trimmed, `, ""`) {
-			t.Errorf("main.go:%d returns a message id on a FAILURE path: %s", i+1, trimmed)
+		call, ok := assign.Rhs[0].(*ast.CallExpr)
+		if !ok {
+			return true
 		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "SendMessage" {
+			return true
+		}
+		if ident, ok := assign.Lhs[0].(*ast.Ident); ok {
+			respName = ident.Name
+		}
+		return false
+	})
+	if respName == "" {
+		t.Fatal("sendWhatsAppMessage no longer assigns the result of client.SendMessage — " +
+			"there is nothing left to source a provider message id from")
+	}
+
+	successes, failures := 0, 0
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false // nested closures are not this function's contract
+		}
+		ret, ok := n.(*ast.ReturnStmt)
+		if !ok {
+			return true
+		}
+		if len(ret.Results) != 3 {
+			t.Errorf("%s: return has %d values, want 3 (accepted, humanMessage, messageID)",
+				fset.Position(ret.Pos()), len(ret.Results))
+			return true
+		}
+		accepted, ok := ret.Results[0].(*ast.Ident)
+		if !ok {
+			t.Errorf("%s: first return value is not the literal true/false", fset.Position(ret.Pos()))
+			return true
+		}
+		id := ret.Results[2]
+
+		switch accepted.Name {
+		case "false":
+			failures++
+			lit, ok := id.(*ast.BasicLit)
+			if !ok || lit.Value != `""` {
+				t.Errorf("%s: FAILURE return carries a message id (%s) — a send that did not "+
+					"happen must not produce a handle", fset.Position(ret.Pos()), exprText(fset, id))
+			}
+		case "true":
+			successes++
+			sel, ok := id.(*ast.SelectorExpr)
+			if !ok {
+				t.Errorf("%s: SUCCESS return hands back %s, want %s.ID from client.SendMessage — "+
+					"the ledger records this value and would go back to NULL",
+					fset.Position(ret.Pos()), exprText(fset, id), respName)
+				return true
+			}
+			x, _ := sel.X.(*ast.Ident)
+			if x == nil || x.Name != respName || sel.Sel.Name != "ID" {
+				t.Errorf("%s: SUCCESS return hands back %s, want %s.ID (the id bound by "+
+					"client.SendMessage)", fset.Position(ret.Pos()), exprText(fset, id), respName)
+			}
+		default:
+			t.Errorf("%s: first return value is %q, want the literal true or false",
+				fset.Position(ret.Pos()), accepted.Name)
+		}
+		return true
+	})
+
+	if successes != 1 {
+		t.Errorf("found %d success returns, want exactly 1 — more than one acceptance path means "+
+			"one of them can go unguarded", successes)
 	}
 	if failures == 0 {
 		t.Fatal("found no failure returns in sendWhatsAppMessage — this test has stopped testing anything")
 	}
-	t.Logf("checked %d failure return paths, all carry an empty message id", failures)
+	t.Logf("checked 1 success return (%s.ID) and %d failure returns", respName, failures)
+}
+
+func exprText(fset *token.FileSet, e ast.Expr) string {
+	var buf strings.Builder
+	if err := printer.Fprint(&buf, fset, e); err != nil {
+		return "<unprintable>"
+	}
+	return buf.String()
 }
