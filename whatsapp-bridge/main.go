@@ -1039,14 +1039,22 @@ func extractTextContent(msg *waProto.Message) string {
 type SendMessageResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
-	// MessageID is WhatsApp's OWN id for the message it accepted. It is the
-	// only durable handle the caller gets: without it, a ledger row can say
-	// "the bridge did not error" and nothing more, which is not the same claim
-	// as "WhatsApp took this message". Omitted rather than emitted empty, so a
-	// caller can tell "accepted, no id" from "accepted, id was blank".
+	// MessageID is the id THIS CLIENT attached to the send, which we only ever
+	// return when WhatsApp did not error accepting it. It is not minted by
+	// WhatsApp and carries no provenance of its own: whatsmeow generates it
+	// locally before the round trip (send.go: req.ID = cli.GenerateMessageID();
+	// resp.ID = req.ID). The only thing that ties it to WhatsApp is that
+	// client.SendMessage returned a nil error, which is why every failure path
+	// returns "".
 	//
-	// ACCEPTED IS NOT DELIVERED. This id proves WhatsApp received and
-	// addressed the message. It says nothing about delivery to the recipient's
+	// It is still the only durable handle the caller gets: without it a ledger
+	// row can say "the bridge did not error" and nothing more, and nothing
+	// downstream can be correlated back to this message. Omitted rather than
+	// emitted empty, so a caller can tell "accepted, no id" from "accepted, id
+	// was blank".
+	//
+	// ACCEPTED IS NOT DELIVERED. At most this says WhatsApp took the message
+	// without complaint. It says nothing about delivery to the recipient's
 	// device, or about them reading it. Anything downstream that renders this
 	// as "delivered" is overclaiming.
 	MessageID string `json:"message_id,omitempty"`
@@ -1061,7 +1069,9 @@ type SendMessageRequest struct {
 
 // sendFunc is the one thing the /api/send handler needs from the WhatsApp
 // client: given a recipient, a body and an optional media path, did WhatsApp
-// accept it, what should a human be told, and what id did WhatsApp give it.
+// accept it, what should a human be told, and what id is this message filed
+// under (client-generated; see SendMessageResponse.MessageID). Empty id on
+// every non-accepted path.
 type sendFunc func(recipient, message, mediaPath string) (accepted bool, humanMessage string, messageID string)
 
 // sendHandler is the /api/send handler, extracted from startRESTServer so the
