@@ -1059,6 +1059,64 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
+// sendFunc is the one thing the /api/send handler needs from the WhatsApp
+// client: given a recipient, a body and an optional media path, did WhatsApp
+// accept it, what should a human be told, and what id did WhatsApp give it.
+type sendFunc func(recipient, message, mediaPath string) (accepted bool, humanMessage string, messageID string)
+
+// sendHandler is the /api/send handler, extracted from startRESTServer so the
+// wire format can be tested without a logged-in WhatsApp client. The body is a
+// verbatim move; the only reason it is a named function is that the response
+// JSON is a contract Buddy's ledger depends on, and an untested contract is how
+// the ledger came to record NULL ids in the first place.
+func sendHandler(send sendFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Only allow POST requests
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse the request body
+		var req SendMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		// Validate request
+		if req.Recipient == "" {
+			http.Error(w, "Recipient is required", http.StatusBadRequest)
+			return
+		}
+
+		if req.Message == "" && req.MediaPath == "" {
+			http.Error(w, "Message or media path is required", http.StatusBadRequest)
+			return
+		}
+
+		fmt.Println("Received request to send message", req.Message, req.MediaPath)
+
+		// Send the message
+		success, message, messageID := send(req.Recipient, req.Message, req.MediaPath)
+		fmt.Println("Message sent", success, message, messageID)
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// Set appropriate status code
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+
+		// Send response
+		_ = json.NewEncoder(w).Encode(SendMessageResponse{
+			Success:   success,
+			Message:   message,
+			MessageID: messageID,
+		})
+	}
+}
+
 // Function to send a WhatsApp message.
 //
 // Returns (accepted, humanMessage, messageID). messageID is WhatsApp's own id
@@ -2012,51 +2070,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST requests
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Parse the request body
-		var req SendMessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
-			return
-		}
-
-		// Validate request
-		if req.Recipient == "" {
-			http.Error(w, "Recipient is required", http.StatusBadRequest)
-			return
-		}
-
-		if req.Message == "" && req.MediaPath == "" {
-			http.Error(w, "Message or media path is required", http.StatusBadRequest)
-			return
-		}
-
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
-
-		// Send the message
-		success, message, messageID := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
-		fmt.Println("Message sent", success, message, messageID)
-		// Set response headers
-		w.Header().Set("Content-Type", "application/json")
-
-		// Set appropriate status code
-		if !success {
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-
-		// Send response
-		_ = json.NewEncoder(w).Encode(SendMessageResponse{
-			Success:   success,
-			Message:   message,
-			MessageID: messageID,
-		})
-	})
+	http.HandleFunc("/api/send", sendHandler(
+		func(recipient, message, mediaPath string) (bool, string, string) {
+			return sendWhatsAppMessage(client, messageStore, recipient, message, mediaPath)
+		},
+	))
 
 	// Handler for downloading media
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
