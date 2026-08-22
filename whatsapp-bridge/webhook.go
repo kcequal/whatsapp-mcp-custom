@@ -14,6 +14,38 @@ import (
 // timeout) would stall ALL message ingestion behind one hung POST.
 var webhookClient = &http.Client{Timeout: 5 * time.Second}
 
+// ForwardingInspectionStatus says whether this bridge was ABLE to look at the
+// message's forwarding metadata — which is a different question from what it
+// found. The consumer refuses to send from a message it cannot vouch for, so
+// "I could not look" must never be expressible as "I looked and it was clean".
+type ForwardingInspectionStatus string
+
+const (
+	// ForwardingInspected: this carrier is one we know how to read, and the
+	// evidence fields below reflect what WhatsApp actually supplied.
+	ForwardingInspected ForwardingInspectionStatus = "inspected"
+	// ForwardingUnsupportedCarrier: a message shape this bridge cannot read
+	// forwarding metadata from. Reported honestly rather than defaulted.
+	ForwardingUnsupportedCarrier ForwardingInspectionStatus = "unsupported_carrier"
+)
+
+// ForwardingInspection is EVIDENCE plus the status of the inspection, never a
+// verdict. Deciding what it means belongs to the brain, not to a transport
+// adapter.
+//
+// Both evidence fields are POINTERS on purpose, and this is the subtle part:
+// Go's `omitempty` erases a `false` bool and a `0` int, so plain scalars would
+// make "explicitly not forwarded" byte-identical to "never checked". A pointer
+// distinguishes absent from present-and-zero. The OUTER pointer on the payload
+// field does the same job one level up: no object at all means an OLD BRIDGE
+// that knew nothing about forwarding, which the consumer must also treat as
+// unproven.
+type ForwardingInspection struct {
+	InspectionStatus ForwardingInspectionStatus `json:"inspection_status"`
+	IsForwarded      *bool                      `json:"is_forwarded,omitempty"`
+	ForwardingScore  *uint32                    `json:"forwarding_score,omitempty"`
+}
+
 // WebhookPayload represents the data sent to the webhook
 type WebhookPayload struct {
 	MessageId        string `json:"messageId,omitempty"`
@@ -30,6 +62,11 @@ type WebhookPayload struct {
 	Filename   string `json:"filename,omitempty"`
 	FileLength uint64 `json:"file_length,omitempty"`
 	IsPTT      bool   `json:"is_ptt,omitempty"`
+
+	// Nil means this bridge never inspected forwarding at all (an old build).
+	// The consumer fails closed on that, so adding the field is additive: an
+	// old listener ignores it, and a new listener refuses rather than assumes.
+	Forwarding *ForwardingInspection `json:"forwarding,omitempty"`
 }
 
 // SendWebhook sends a message to the webhook endpoint.
@@ -38,7 +75,7 @@ type WebhookPayload struct {
 // reply on the exact message (rather than re-deriving it from a stale DB
 // lookup). When LISTENER_WEBHOOK_TOKEN is set, the request carries a matching
 // X-Listener-Token header so the listener can authenticate the caller.
-func SendWebhook(messageId, sender, content, chatJID string, isFromMe bool, quotedMessageId, quotedSender, quotedContent, mediaType, filename string, fileLength uint64, isPTT bool) {
+func SendWebhook(messageId, sender, content, chatJID string, isFromMe bool, quotedMessageId, quotedSender, quotedContent, mediaType, filename string, fileLength uint64, isPTT bool, forwarding *ForwardingInspection) {
 	webhookURL := os.Getenv("WEBHOOK_URL")
 	if webhookURL == "" {
 		webhookURL = "http://localhost:8769/whatsapp/webhook"
@@ -57,6 +94,7 @@ func SendWebhook(messageId, sender, content, chatJID string, isFromMe bool, quot
 		Filename:        filename,
 		FileLength:      fileLength,
 		IsPTT:           isPTT,
+		Forwarding:      forwarding,
 	}
 
 	jsonData, err := json.Marshal(payload)

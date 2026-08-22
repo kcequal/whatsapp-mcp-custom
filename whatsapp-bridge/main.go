@@ -1297,6 +1297,66 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	return true, fmt.Sprintf("Message sent to %s", recipient)
 }
 
+// inspectForwarding reports whether WhatsApp says this message was forwarded,
+// AND whether this bridge was able to look at all. Those are different facts and
+// collapsing them is the bug this function exists to prevent: a consumer that
+// cannot tell "I looked and it is not forwarded" from "I have no idea" ends up
+// treating every message it cannot read as if the owner typed it.
+//
+// Returns nil ONLY if msg is nil. Every other path reports a status.
+//
+// SUPPORTED CARRIERS. A plain Conversation cannot carry ContextInfo at all — a
+// forwarded text arrives as an ExtendedTextMessage — so a bare Conversation is
+// inspected and clean, not unsupported. The five ContextInfo-bearing types
+// below are the ones this bridge knows how to read. Everything else (stickers,
+// locations, contacts, polls, album and view-once wrappers, and anything the
+// protobuf gains later) reports unsupported_carrier rather than guessing,
+// because the protobuf carries ContextInfo on more types than these.
+//
+// EXPLICIT ZEROES, deliberately. When the carrier is supported we always emit
+// both evidence fields, even when WhatsApp omitted them, so "inspected" always
+// arrives with values attached. The alternative — passing protobuf absence
+// through as JSON absence — leaves the consumer unable to distinguish a field
+// WhatsApp omitted from a field this bridge forgot to set, and it has to fail
+// closed on both anyway.
+func inspectForwarding(msg *waProto.Message) *ForwardingInspection {
+	if msg == nil {
+		return nil
+	}
+
+	var contextInfo *waProto.ContextInfo
+	supported := false
+
+	switch {
+	case msg.GetConversation() != "":
+		// Plain text: no ContextInfo exists on this type, so there is nothing
+		// to read and nothing forwarded.
+		supported = true
+	case msg.GetExtendedTextMessage() != nil:
+		supported, contextInfo = true, msg.GetExtendedTextMessage().GetContextInfo()
+	case msg.GetImageMessage() != nil:
+		supported, contextInfo = true, msg.GetImageMessage().GetContextInfo()
+	case msg.GetVideoMessage() != nil:
+		supported, contextInfo = true, msg.GetVideoMessage().GetContextInfo()
+	case msg.GetDocumentMessage() != nil:
+		supported, contextInfo = true, msg.GetDocumentMessage().GetContextInfo()
+	case msg.GetAudioMessage() != nil:
+		supported, contextInfo = true, msg.GetAudioMessage().GetContextInfo()
+	}
+
+	if !supported {
+		return &ForwardingInspection{InspectionStatus: ForwardingUnsupportedCarrier}
+	}
+
+	isForwarded := contextInfo.GetIsForwarded()
+	score := contextInfo.GetForwardingScore()
+	return &ForwardingInspection{
+		InspectionStatus: ForwardingInspected,
+		IsForwarded:      &isForwarded,
+		ForwardingScore:  &score,
+	}
+}
+
 // Extract quoted message info from ContextInfo
 func extractQuotedMessageInfo(msg *waProto.Message) (quotedMessageId string, quotedSender string, quotedContent string) {
 	if msg == nil {
@@ -1611,7 +1671,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		if aud := msg.Message.GetAudioMessage(); aud != nil {
 			isPTT = aud.GetPTT()
 		}
-		SendWebhook(msg.Info.ID, sender, content, chatJID, msg.Info.IsFromMe, quotedMessageId, quotedSender, quotedContent, mediaType, filename, fileLength, isPTT)
+		SendWebhook(msg.Info.ID, sender, content, chatJID, msg.Info.IsFromMe, quotedMessageId, quotedSender, quotedContent, mediaType, filename, fileLength, isPTT, inspectForwarding(msg.Message))
 	}
 
 	if err != nil {
