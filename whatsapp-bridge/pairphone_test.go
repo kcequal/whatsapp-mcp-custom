@@ -69,3 +69,57 @@ func TestRejectedPairPhoneYieldsNoDigits(t *testing.T) {
 		}
 	}
 }
+
+// The bridge links a device to the ASSISTANT's WhatsApp account. KC_BOT_PHONE
+// already holds that number and is already loaded by the bridge unit, so the
+// fallback is what makes recovery need no config change on the box.
+//
+// The alternative -- a brand new variable in instance.env -- would have been
+// inert on the very box being fixed, because instance.env is generated once and
+// never refreshed.
+func TestPairPhoneSetting(t *testing.T) {
+	cases := []struct {
+		name       string
+		pairPhone  string
+		botPhone   string
+		wantRaw    string
+		wantSource string
+	}{
+		{"neither set", "", "", "", "PAIR_PHONE"},
+		{"bot phone alone is used", "", "918008999999", "918008999999", "KC_BOT_PHONE"},
+		{"explicit pair phone alone", "919999999999", "", "919999999999", "PAIR_PHONE"},
+		{"explicit overrides the bot phone", "919999999999", "918008999999", "919999999999", "PAIR_PHONE"},
+		{"blank pair phone falls through to bot phone", "   ", "918008999999", "918008999999", "KC_BOT_PHONE"},
+		{"blank both is not a match", "  ", "  ", "", "PAIR_PHONE"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PAIR_PHONE", tc.pairPhone)
+			t.Setenv("KC_BOT_PHONE", tc.botPhone)
+			raw, source := pairPhoneSetting()
+			if raw != tc.wantRaw {
+				t.Errorf("raw = %q, want %q", raw, tc.wantRaw)
+			}
+			if source != tc.wantSource {
+				t.Errorf("source = %q, want %q", source, tc.wantSource)
+			}
+		})
+	}
+}
+
+// The real production value must survive the whole path, digits intact.
+func TestKeshavBotPhoneEndToEnd(t *testing.T) {
+	t.Setenv("PAIR_PHONE", "")
+	t.Setenv("KC_BOT_PHONE", "918008999999")
+	raw, source := pairPhoneSetting()
+	digits, problem := normalizePairPhone(raw)
+	if problem != "" {
+		t.Fatalf("the assistant's real number was rejected: %s", problem)
+	}
+	if digits != "918008999999" {
+		t.Errorf("digits = %q, want the assistant number 918008999999", digits)
+	}
+	if source != "KC_BOT_PHONE" {
+		t.Errorf("source = %q, want KC_BOT_PHONE", source)
+	}
+}
