@@ -924,6 +924,34 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 // ContextInfo.MentionedJid array; just typing @<lid> in text shows raw.
 var mentionRe = regexp.MustCompile(`@(\d{6,})`)
 
+// nonDigits strips '+', spaces, dashes and brackets out of PAIR_PHONE so a
+// number pasted in any human format still reaches whatsmeow as bare digits.
+var nonDigits = regexp.MustCompile(`\D`)
+
+// normalizePairPhone turns a human-entered PAIR_PHONE into the bare digits
+// whatsmeow wants, or returns why it cannot.
+//
+// Returns ("", "") when unset — that is not an error, it just means this box
+// keeps the QR-only behaviour. Otherwise it returns either the digits or a
+// problem string, never both. The two rejections mirror whatsmeow's own
+// ErrPhoneNumberTooShort and ErrPhoneNumberIsNotInternational, checked HERE so
+// a typo is reported at startup against the value the operator actually typed,
+// rather than 40 seconds later as a failed IQ with the sanitised digits.
+func normalizePairPhone(raw string) (digits string, problem string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", ""
+	}
+	digits = nonDigits.ReplaceAllString(raw, "")
+	switch {
+	case len(digits) <= 6:
+		return "", fmt.Sprintf("%q has %d digits, too few to be an international phone number", raw, len(digits))
+	case strings.HasPrefix(digits, "0"):
+		return "", fmt.Sprintf("%q starts with 0, so it is a national number, not international form (drop the leading 0 and prefix the country code)", raw)
+	}
+	return digits, ""
+}
+
 // extractMentions returns the @<digits> mentions in `text` as fully-qualified
 // LID JIDs. Empty slice if no mentions found. Caller assigns the result to
 // ContextInfo.MentionedJid so receiving clients render clickable tags.
@@ -2762,6 +2790,18 @@ func main() {
 	// Create channel to track connection success
 	connected := make(chan bool, 1)
 
+	// PAIR_PHONE: link by 8-character code instead of a QR scan. Digits only,
+	// full international form with no leading zero and no '+' (whatsmeow rejects
+	// both). Empty or unset keeps the QR-only behaviour, so this is opt-in per
+	// box and changes nothing for an already-linked bridge.
+	pairPhone, pairPhoneProblem := normalizePairPhone(os.Getenv("PAIR_PHONE"))
+	switch {
+	case pairPhoneProblem != "":
+		logger.Errorf("PAIR_PHONE ignored, falling back to QR: %s", pairPhoneProblem)
+	case pairPhone != "":
+		logger.Infof("PAIR_PHONE set — will request a linking code for %s instead of relying on a QR scan", pairPhone)
+	}
+
 	// Add connection retry logic
 	maxRetries := 3
 	var connErr error
@@ -2797,8 +2837,37 @@ func main() {
 
 			// Print QR code for pairing with phone
 			qrCodeShown := false
+			pairCodeRequested := false
 			for evt := range qrChan {
 				if evt.Event == "code" {
+					// PAIR_PHONE turns this into a LINKING CODE login instead of a
+					// QR scan. A QR is only valid ~20s, and on a headless box the
+					// code has to travel to whoever holds the phone: capturing it,
+					// rendering it and delivering it costs 10-15s of that, so the
+					// scan loses the race. Measured 2026-08-22 relinking Keshav's
+					// bridge: four consecutive attempts expired in flight.
+					//
+					// A linking code is 8 characters of text and stays valid for
+					// the whole login window (~160s, bounded by the QR codes running
+					// out), so it survives being forwarded over WhatsApp.
+					//
+					// whatsmeow requires Connect() first and the first QR event
+					// before PairPhone, which is exactly here. Requested ONCE:
+					// each call mints a new code and invalidates the last, so
+					// retrying per rotation would keep expiring the code we sent.
+					if pairPhone != "" && !pairCodeRequested {
+						pairCodeRequested = true
+						// Display name MUST look like "Browser (OS)" or the server
+						// rejects the request with a 400.
+						code, pairErr := client.PairPhone(ctx, pairPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+						if pairErr != nil {
+							logger.Errorf("PairPhone failed for %s: %v (falling back to the QR below)", pairPhone, pairErr)
+						} else {
+							fmt.Printf("\nPAIRING CODE: %s\n", code)
+							fmt.Println("On the phone: WhatsApp > Linked Devices > Link a device > Link with phone number instead")
+							logger.Infof("pairing code issued for %s", pairPhone)
+						}
+					}
 					if !qrCodeShown {
 						fmt.Println("\nScan this QR code with your WhatsApp app:")
 						qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
