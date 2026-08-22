@@ -937,6 +937,36 @@ var nonDigits = regexp.MustCompile(`\D`)
 // ErrPhoneNumberTooShort and ErrPhoneNumberIsNotInternational, checked HERE so
 // a typo is reported at startup against the value the operator actually typed,
 // rather than 40 seconds later as a failed IQ with the sanitised digits.
+// pairPhoneSetting picks which env var supplies the number to pair with, and
+// names it so the log says where the value came from.
+//
+// The fallback to KC_BOT_PHONE is the point. The bridge links a device to the
+// ASSISTANT's WhatsApp account, not to any human's, and KC_BOT_PHONE is already
+// that number — it is set in the per-box env file the bridge unit already loads
+// (EnvironmentFile). Falling back to it means recovering a logged-out bridge
+// needs NO config change on the box.
+//
+// That matters here specifically: instance.env is generated once and never
+// refreshed, so a value added to the committed example does NOT reach a box that
+// already has the file. Depending on a NEW variable would have silently done
+// nothing on exactly the box we are trying to fix.
+//
+// Getting this wrong is not academic: on 2026-08-22 four QR codes were sent to
+// the OWNER's personal number, which would have linked his personal WhatsApp to
+// the assistant's bridge had he scanned one.
+//
+// PAIR_PHONE still wins when set, so a box can override without touching the
+// bot identity.
+func pairPhoneSetting() (raw string, source string) {
+	if v := strings.TrimSpace(os.Getenv("PAIR_PHONE")); v != "" {
+		return v, "PAIR_PHONE"
+	}
+	if v := strings.TrimSpace(os.Getenv("KC_BOT_PHONE")); v != "" {
+		return v, "KC_BOT_PHONE"
+	}
+	return "", "PAIR_PHONE"
+}
+
 func normalizePairPhone(raw string) (digits string, problem string) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -2794,12 +2824,13 @@ func main() {
 	// full international form with no leading zero and no '+' (whatsmeow rejects
 	// both). Empty or unset keeps the QR-only behaviour, so this is opt-in per
 	// box and changes nothing for an already-linked bridge.
-	pairPhone, pairPhoneProblem := normalizePairPhone(os.Getenv("PAIR_PHONE"))
+	pairPhoneRaw, pairPhoneSource := pairPhoneSetting()
+	pairPhone, pairPhoneProblem := normalizePairPhone(pairPhoneRaw)
 	switch {
 	case pairPhoneProblem != "":
-		logger.Errorf("PAIR_PHONE ignored, falling back to QR: %s", pairPhoneProblem)
+		logger.Errorf("%s ignored, falling back to QR: %s", pairPhoneSource, pairPhoneProblem)
 	case pairPhone != "":
-		logger.Infof("PAIR_PHONE set — will request a linking code for %s instead of relying on a QR scan", pairPhone)
+		logger.Infof("will request a linking code for %s (from %s) instead of relying on a QR scan", pairPhone, pairPhoneSource)
 	}
 
 	// Add connection retry logic
