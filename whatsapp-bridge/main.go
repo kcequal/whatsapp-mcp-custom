@@ -1039,6 +1039,25 @@ func extractTextContent(msg *waProto.Message) string {
 type SendMessageResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
+	// MessageID is the id THIS CLIENT attached to the send, which we only ever
+	// return when WhatsApp did not error accepting it. It is not minted by
+	// WhatsApp and carries no provenance of its own: whatsmeow generates it
+	// locally before the round trip (send.go: req.ID = cli.GenerateMessageID();
+	// resp.ID = req.ID). The only thing that ties it to WhatsApp is that
+	// client.SendMessage returned a nil error, which is why every failure path
+	// returns "".
+	//
+	// It is still the only durable handle the caller gets: without it a ledger
+	// row can say "the bridge did not error" and nothing more, and nothing
+	// downstream can be correlated back to this message. Omitted rather than
+	// emitted empty, so a caller can tell "accepted, no id" from "accepted, id
+	// was blank".
+	//
+	// ACCEPTED IS NOT DELIVERED. At most this says WhatsApp took the message
+	// without complaint. It says nothing about delivery to the recipient's
+	// device, or about them reading it. Anything downstream that renders this
+	// as "delivered" is overclaiming.
+	MessageID string `json:"message_id,omitempty"`
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -1048,10 +1067,76 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
-// Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
+// sendFunc is the one thing the /api/send handler needs from the WhatsApp
+// client: given a recipient, a body and an optional media path, did WhatsApp
+// accept it, what should a human be told, and what id is this message filed
+// under (client-generated; see SendMessageResponse.MessageID). Empty id on
+// every non-accepted path.
+type sendFunc func(recipient, message, mediaPath string) (accepted bool, humanMessage string, messageID string)
+
+// sendHandler is the /api/send handler, extracted from startRESTServer so the
+// wire format can be tested without a logged-in WhatsApp client. The body is a
+// verbatim move; the only reason it is a named function is that the response
+// JSON is a contract Buddy's ledger depends on, and an untested contract is how
+// the ledger came to record NULL ids in the first place.
+func sendHandler(send sendFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Only allow POST requests
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse the request body
+		var req SendMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		// Validate request
+		if req.Recipient == "" {
+			http.Error(w, "Recipient is required", http.StatusBadRequest)
+			return
+		}
+
+		if req.Message == "" && req.MediaPath == "" {
+			http.Error(w, "Message or media path is required", http.StatusBadRequest)
+			return
+		}
+
+		fmt.Println("Received request to send message", req.Message, req.MediaPath)
+
+		// Send the message
+		success, message, messageID := send(req.Recipient, req.Message, req.MediaPath)
+		fmt.Println("Message sent", success, message, messageID)
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// Set appropriate status code
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+
+		// Send response
+		_ = json.NewEncoder(w).Encode(SendMessageResponse{
+			Success:   success,
+			Message:   message,
+			MessageID: messageID,
+		})
+	}
+}
+
+// Function to send a WhatsApp message.
+//
+// Returns (accepted, humanMessage, messageID). messageID is WhatsApp's own id
+// for the accepted message and is "" on every failure path, and only on those.
+// It is deliberately a third return value rather than being folded into the
+// human message: callers persist it, and parsing it back out of prose is how
+// ledgers start lying.
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string, string) {
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		return false, "Not connected to WhatsApp", ""
 	}
 
 	// Create JID for recipient
@@ -1065,7 +1150,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		// Parse the JID string
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+			return false, fmt.Sprintf("Error parsing JID: %v", err), ""
 		}
 	} else {
 		// Create JID from phone number
@@ -1110,7 +1195,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+			return false, fmt.Sprintf("Error reading media file: %v", err), ""
 		}
 
 		// Determine media type and mime type based on file extension
@@ -1194,7 +1279,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		// Upload media to WhatsApp servers
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err)
+			return false, fmt.Sprintf("Error uploading media: %v", err), ""
 		}
 
 		fmt.Println("Media uploaded", resp)
@@ -1224,7 +1309,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
 				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err), ""
 				}
 			} else {
 				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
@@ -1289,12 +1374,12 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err)
+		return false, fmt.Sprintf("Error sending message: %v", err), ""
 	}
 
 	recordOutgoing(client, messageStore, recipientJID, recipientAlt, resp, msg)
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	return true, fmt.Sprintf("Message sent to %s", recipient), resp.ID
 }
 
 // inspectForwarding reports whether WhatsApp says this message was forwarded,
@@ -1995,50 +2080,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST requests
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Parse the request body
-		var req SendMessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
-			return
-		}
-
-		// Validate request
-		if req.Recipient == "" {
-			http.Error(w, "Recipient is required", http.StatusBadRequest)
-			return
-		}
-
-		if req.Message == "" && req.MediaPath == "" {
-			http.Error(w, "Message or media path is required", http.StatusBadRequest)
-			return
-		}
-
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
-
-		// Send the message
-		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
-		fmt.Println("Message sent", success, message)
-		// Set response headers
-		w.Header().Set("Content-Type", "application/json")
-
-		// Set appropriate status code
-		if !success {
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-
-		// Send response
-		_ = json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
-		})
-	})
+	http.HandleFunc("/api/send", sendHandler(
+		func(recipient, message, mediaPath string) (bool, string, string) {
+			return sendWhatsAppMessage(client, messageStore, recipient, message, mediaPath)
+		},
+	))
 
 	// Handler for downloading media
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
