@@ -8,6 +8,12 @@ from whatsapp import (
     download_media as whatsapp_download_media,
 )
 from whatsapp import (
+    edit_message as whatsapp_edit_message,
+)
+from whatsapp import (
+    forward_message as whatsapp_forward_message,
+)
+from whatsapp import (
     get_chat as whatsapp_get_chat,
 )
 from whatsapp import (
@@ -15,6 +21,9 @@ from whatsapp import (
 )
 from whatsapp import (
     get_direct_chat_by_contact as whatsapp_get_direct_chat_by_contact,
+)
+from whatsapp import (
+    get_group_info as whatsapp_get_group_info,
 )
 from whatsapp import (
     get_last_interaction as whatsapp_get_last_interaction,
@@ -30,24 +39,6 @@ from whatsapp import (
 )
 from whatsapp import (
     list_messages as whatsapp_list_messages,
-)
-from whatsapp import (
-    search_contacts as whatsapp_search_contacts,
-)
-from whatsapp import (
-    send_audio_message as whatsapp_audio_voice_message,
-)
-from whatsapp import (
-    send_file as whatsapp_send_file,
-)
-from whatsapp import (
-    edit_message as whatsapp_edit_message,
-)
-from whatsapp import (
-    forward_message as whatsapp_forward_message,
-)
-from whatsapp import (
-    get_group_info as whatsapp_get_group_info,
 )
 from whatsapp import (
     list_recent_calls as whatsapp_list_recent_calls,
@@ -68,16 +59,25 @@ from whatsapp import (
     revoke_message as whatsapp_revoke_message,
 )
 from whatsapp import (
+    search_contacts as whatsapp_search_contacts,
+)
+from whatsapp import (
+    send_audio_message as whatsapp_audio_voice_message,
+)
+from whatsapp import (
+    send_file as whatsapp_send_file,
+)
+from whatsapp import (
     send_location as whatsapp_send_location,
+)
+from whatsapp import (
+    send_message as whatsapp_send_message,
 )
 from whatsapp import (
     send_sticker as whatsapp_send_sticker,
 )
 from whatsapp import (
     update_group_participants as whatsapp_update_group_participants,
-)
-from whatsapp import (
-    send_message as whatsapp_send_message,
 )
 
 # Initialize FastMCP server
@@ -362,16 +362,12 @@ def reply_to_message(
         reply_to_sender: JID of the original sender. Required for groups; for 1:1 chats
                         it can be left blank and will default to the chat JID.
     """
-    success, status = whatsapp_reply_to_message(
-        recipient, message, reply_to_message_id, reply_to_sender
-    )
+    success, status = whatsapp_reply_to_message(recipient, message, reply_to_message_id, reply_to_sender)
     return {"success": success, "message": status}
 
 
 @mcp.tool()
-def forward_message(
-    recipient: str, message_id: str, source_chat_jid: str
-) -> dict[str, Any]:
+def forward_message(recipient: str, message_id: str, source_chat_jid: str) -> dict[str, Any]:
     """Forward an existing TEXT message to another chat with the "Forwarded" badge.
 
     For media messages, use download_media + send_file from the calling side instead.
@@ -399,9 +395,7 @@ def edit_message(recipient: str, message_id: str, new_message: str) -> dict[str,
 
 
 @mcp.tool()
-def revoke_message(
-    recipient: str, message_id: str, sender: str = ""
-) -> dict[str, Any]:
+def revoke_message(recipient: str, message_id: str, sender: str = "") -> dict[str, Any]:
     """Delete a sent message for everyone ("revoke"). WhatsApp allows ~2 days after send.
 
     Args:
@@ -428,9 +422,7 @@ def mark_messages_read(
         sender_jid: Original sender's JID (required for groups; defaults to the chat for DMs).
         receipt_type: "read" (default), "delivered", or "played" (for voice notes).
     """
-    success, status = whatsapp_mark_messages_read(
-        chat_jid, message_ids, sender_jid, receipt_type
-    )
+    success, status = whatsapp_mark_messages_read(chat_jid, message_ids, sender_jid, receipt_type)
     return {"success": success, "message": status}
 
 
@@ -456,9 +448,7 @@ def get_group_info(group_jid: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def update_group_participants(
-    group_jid: str, action: str, jids: list[str]
-) -> dict[str, Any]:
+def update_group_participants(group_jid: str, action: str, jids: list[str]) -> dict[str, Any]:
     """Add, remove, promote, or demote participants in a WhatsApp group.
 
     Args:
@@ -466,9 +456,7 @@ def update_group_participants(
         action: One of "add", "remove", "promote", "demote".
         jids: Phone numbers (no +) or JIDs of the participants to act on.
     """
-    success, status, participants = whatsapp_update_group_participants(
-        group_jid, action, jids
-    )
+    success, status, participants = whatsapp_update_group_participants(group_jid, action, jids)
     return {"success": success, "message": status, "participants": participants}
 
 
@@ -520,9 +508,7 @@ def list_recent_calls(limit: int = 50, after: str = "") -> dict[str, Any]:
 
 
 @mcp.tool()
-def react_to_message(
-    recipient: str, message_id: str, emoji: str, from_me: bool = True
-) -> dict[str, Any]:
+def react_to_message(recipient: str, message_id: str, emoji: str, from_me: bool = True) -> dict[str, Any]:
     """Send an emoji reaction to an existing WhatsApp message.
 
     Args:
@@ -620,6 +606,7 @@ def search_messages(
         List of matching messages with chat name + sender, ranked by relevance.
     """
     from whatsapp import search_messages as _search
+
     return _search(query=query, chat_jid=chat_jid, after=after, before=before, limit=limit)
 
 
@@ -652,6 +639,7 @@ def catch_up(
         On error: same shape with chats=[] and an `error` key.
     """
     from whatsapp import catch_up as _catch_up
+
     return _catch_up(
         hours=hours,
         awaiting_my_reply=awaiting_my_reply,
@@ -684,6 +672,7 @@ def transcribe_audio(
         {'success': bool, 'text': '...', 'provider': '...', 'audio_path': '...'}
     """
     from whatsapp import transcribe_audio as _transcribe
+
     return _transcribe(message_id=message_id, chat_jid=chat_jid, provider=provider, language=language)
 
 
@@ -701,6 +690,7 @@ def request_history(chat_jid: str, count: int = 100) -> dict[str, Any]:
         {'success': bool, 'message': '...'}
     """
     from whatsapp import request_history as _request_history
+
     return _request_history(chat_jid=chat_jid, count=count)
 
 

@@ -3,7 +3,7 @@ import os
 import os.path
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import requests
@@ -830,18 +830,12 @@ def forward_message(recipient: str, message_id: str, source_chat_jid: str) -> tu
 
 
 def edit_message(recipient: str, message_id: str, new_message: str) -> tuple[bool, str]:
-    ok, msg, _ = _post_bridge(
-        "/edit", {"recipient": recipient, "message_id": message_id, "new_message": new_message}
-    )
+    ok, msg, _ = _post_bridge("/edit", {"recipient": recipient, "message_id": message_id, "new_message": new_message})
     return ok, msg
 
 
-def revoke_message(
-    recipient: str, message_id: str, sender: str = ""
-) -> tuple[bool, str]:
-    ok, msg, _ = _post_bridge(
-        "/revoke", {"recipient": recipient, "message_id": message_id, "sender": sender}
-    )
+def revoke_message(recipient: str, message_id: str, sender: str = "") -> tuple[bool, str]:
+    ok, msg, _ = _post_bridge("/revoke", {"recipient": recipient, "message_id": message_id, "sender": sender})
     return ok, msg
 
 
@@ -870,12 +864,8 @@ def get_group_info(group_jid: str) -> dict:
     return full
 
 
-def update_group_participants(
-    group_jid: str, action: str, jids: list[str]
-) -> tuple[bool, str, list]:
-    ok, msg, full = _post_bridge(
-        "/group/participants", {"group_jid": group_jid, "action": action, "jids": jids}
-    )
+def update_group_participants(group_jid: str, action: str, jids: list[str]) -> tuple[bool, str, list]:
+    ok, msg, full = _post_bridge("/group/participants", {"group_jid": group_jid, "action": action, "jids": jids})
     return ok, msg, full.get("participants", [])
 
 
@@ -896,9 +886,7 @@ def send_location(
 
 
 def send_sticker(recipient: str, sticker_path: str) -> tuple[bool, str]:
-    ok, msg, _ = _post_bridge(
-        "/sticker", {"recipient": recipient, "sticker_path": sticker_path}
-    )
+    ok, msg, _ = _post_bridge("/sticker", {"recipient": recipient, "sticker_path": sticker_path})
     return ok, msg
 
 
@@ -907,9 +895,7 @@ def list_recent_calls(limit: int = 50, after: str = "") -> dict:
     return full
 
 
-def react_to_message(
-    recipient: str, message_id: str, emoji: str, from_me: bool = True
-) -> tuple[bool, str]:
+def react_to_message(recipient: str, message_id: str, emoji: str, from_me: bool = True) -> tuple[bool, str]:
     """Send an emoji reaction to an existing WhatsApp message.
 
     Args:
@@ -1164,7 +1150,7 @@ def search_messages(
               FROM messages_fts
               JOIN messages m ON m.rowid = messages_fts.rowid
               LEFT JOIN chats c ON c.jid = m.chat_jid
-             WHERE {' AND '.join(where)}
+             WHERE {" AND ".join(where)}
              ORDER BY rank
              LIMIT ?
         """
@@ -1212,8 +1198,9 @@ def catch_up(
         {window_hours, since, total_chats, total_messages, chats: [...]}
         On error: same shape with `chats: []` and an `error` key.
     """
-    from datetime import datetime, timedelta, timezone
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+    from datetime import datetime, timedelta
+
+    cutoff = (datetime.now(UTC) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
     conn = None
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
@@ -1221,8 +1208,10 @@ def catch_up(
         cur = conn.cursor()
 
         chat_clauses = []
-        if include_groups: chat_clauses.append("chat_jid LIKE '%@g.us'")
-        if include_dms:    chat_clauses.append("chat_jid LIKE '%@s.whatsapp.net' OR chat_jid LIKE '%@lid'")
+        if include_groups:
+            chat_clauses.append("chat_jid LIKE '%@g.us'")
+        if include_dms:
+            chat_clauses.append("chat_jid LIKE '%@s.whatsapp.net' OR chat_jid LIKE '%@lid'")
         chat_filter = "(" + " OR ".join(chat_clauses) + ")" if chat_clauses else "1=1"
         awaiting_filter = "AND l.is_from_me = 0" if awaiting_my_reply else ""
 
@@ -1231,7 +1220,8 @@ def catch_up(
         # ROW_NUMBER. Pushing awaiting_my_reply into SQL avoids fetching +
         # serialising rows we'd otherwise discard — fewer queries, smaller
         # MCP stdio payload.
-        cur.execute(f"""
+        cur.execute(
+            f"""
             WITH chat_activity AS (
                 SELECT m.chat_jid,
                        COUNT(*) AS message_count,
@@ -1265,7 +1255,9 @@ def catch_up(
              WHERE 1=1 {awaiting_filter}
              ORDER BY a.last_ts DESC
              LIMIT ?
-        """, (cutoff, limit_chats))
+        """,
+            (cutoff, limit_chats),
+        )
 
         rows = []
         for r in cur.fetchall():
@@ -1378,7 +1370,11 @@ def _transcribe_openai(audio_path: str, language: str) -> dict[str, Any]:
             timeout=120,
         )
     if resp.status_code != 200:
-        return {"success": False, "error": f"openai whisper {resp.status_code}: {resp.text[:200]}", "audio_path": audio_path}
+        return {
+            "success": False,
+            "error": f"openai whisper {resp.status_code}: {resp.text[:200]}",
+            "audio_path": audio_path,
+        }
     data = resp.json()
     return {"success": True, "text": data.get("text", ""), "provider": "openai-whisper", "audio_path": audio_path}
 
@@ -1402,7 +1398,12 @@ def _transcribe_sarvam(audio_path: str, language: str) -> dict[str, Any]:
     if resp.status_code != 200:
         return {"success": False, "error": f"sarvam {resp.status_code}: {resp.text[:200]}", "audio_path": audio_path}
     data = resp.json()
-    return {"success": True, "text": data.get("transcript", ""), "provider": "sarvam-saarika:v2.5", "audio_path": audio_path}
+    return {
+        "success": True,
+        "text": data.get("transcript", ""),
+        "provider": "sarvam-saarika:v2.5",
+        "audio_path": audio_path,
+    }
 
 
 # ─── History sync request (bridge passthrough) ─────────────────────────────
@@ -1422,9 +1423,13 @@ def request_history(chat_jid: str, count: int = 100) -> dict[str, Any]:
     try:
         url = f"{WHATSAPP_API_BASE_URL}/history_sync"
         resp = requests.post(url, json={"chat_jid": chat_jid, "count": min(max(1, count), 500)}, timeout=30)
-        return resp.json() if resp.status_code == 200 else {
-            "success": False,
-            "message": f"bridge returned {resp.status_code}: {resp.text[:200]}",
-        }
+        return (
+            resp.json()
+            if resp.status_code == 200
+            else {
+                "success": False,
+                "message": f"bridge returned {resp.status_code}: {resp.text[:200]}",
+            }
+        )
     except requests.exceptions.RequestException as e:
         return {"success": False, "message": f"bridge call failed: {e}"}

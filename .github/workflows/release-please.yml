@@ -1,9 +1,22 @@
+# Stopped running on every push to main (2026-08-23). Root cause: the default
+# GitHub Actions token on this repo cannot open PRs (repo Settings > Actions >
+# "Allow GitHub Actions to create and approve pull requests" is off, which is
+# the sane default), and no RELEASE_PLEASE_TOKEN PAT secret has been provisioned
+# to work around that. Fixing it properly needs one of those two things granted
+# by a repo admin -- a real decision, not a workflow-file change.
+#
+# It also has no consumer here: this fork has cut 0 tags and 0 releases in its
+# history, and the only thing that ships from this repo (Buddy's bridge deploy,
+# see deploy/instance/bootstrap.sh WHATSAPP_MCP_REF) pins a raw commit SHA, never
+# a release tag. So until someone actually wants tagged releases + changelogs
+# out of this fork, there is nothing this workflow does that anything downstream
+# depends on -- leaving it on `push` was pure noise (an email per push, always
+# failing). Kept as workflow_dispatch so it can still be run by hand if that
+# changes; not deleted, since the config (release-please-config.json) is fine
+# and the fix path above may be worth it later.
 name: Release Please
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 permissions:
@@ -41,7 +54,7 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version: "1.24"
+          go-version: "1.25"
 
       - uses: actions/setup-python@v6
         with:
@@ -57,7 +70,7 @@ jobs:
           mkdir -p dist
 
           cd whatsapp-bridge
-          GOOS=linux GOARCH=amd64 go build -o ../dist/whatsapp-bridge-linux-amd64 .
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=1 go build -tags sqlite_fts5 -o ../dist/whatsapp-bridge-linux-amd64 .
           cd ..
 
           cd whatsapp-mcp-server
