@@ -69,6 +69,9 @@ func newTestMessageStore(t *testing.T) *MessageStore {
 			file_sha256 BLOB,
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
+			quoted_message_id TEXT,
+			quoted_sender TEXT,
+			quoted_content TEXT,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -509,11 +512,11 @@ func TestStoreMessage_SearchIndexSurvivesRestore(t *testing.T) {
 		t.Fatalf("TouchChat: %v", err)
 	}
 	if err := ms.StoreMessage("m1", chat, "919060899999", "811", "vendor update coralogix",
-		time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+		time.Now(), false, "", "", "", nil, nil, nil, 0, "", "", ""); err != nil {
 		t.Fatalf("first store: %v", err)
 	}
 	if err := ms.StoreMessage("m1", chat, "919060899999", "811", "vendor update inworld",
-		time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+		time.Now(), false, "", "", "", nil, nil, nil, 0, "", "", ""); err != nil {
 		t.Fatalf("re-store: %v", err)
 	}
 
@@ -599,7 +602,7 @@ func TestNormalizeExistingSenders_Idempotent(t *testing.T) {
 		t.Fatalf("TouchChat: %v", err)
 	}
 	if err := ms.StoreMessage("m1", chat, "185366493536339", "", "hello",
-		time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+		time.Now(), false, "", "", "", nil, nil, nil, 0, "", "", ""); err != nil {
 		t.Fatalf("store: %v", err)
 	}
 
@@ -829,5 +832,38 @@ func TestCanonicalSender_ExplicitSuffixBeatsInference(t *testing.T) {
 		map[string]string{value: "911111111111"}, map[string]string{value: "222222222222"})
 	if gotS != "911111111111" || gotL != value {
 		t.Errorf("suffixed + ambiguous: got (%q,%q), want (911111111111,%s)", gotS, gotL, value)
+	}
+}
+
+// TestReplyContextRoundTrips proves the defect this change closes: the bridge
+// has always EXTRACTED quoted message id/sender/content and sent them over the
+// webhook, but StoreMessage never persisted them -- so anything polling this
+// store (taskcap's reply reader) could not tell what a reply referred to.
+// Fails against the pre-change tree: the columns did not exist.
+func TestReplyContextRoundTrips(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chat := "120363@g.us"
+	if err := ms.TouchChat(chat, time.Now()); err != nil {
+		t.Fatalf("TouchChat: %v", err)
+	}
+	if err := ms.StoreMessage("reply1", chat, "919060899999", "811", "no dupe",
+		time.Now(), true, "", "", "", nil, nil, nil, 0,
+		"ORIGINAL_MSG_ID", "919999999999@s.whatsapp.net", "Task proposals B71"); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	var qid, qsender, qcontent string
+	if err := ms.db.QueryRow(
+		`SELECT quoted_message_id, quoted_sender, quoted_content FROM messages WHERE id = ? AND chat_jid = ?`,
+		"reply1", chat).Scan(&qid, &qsender, &qcontent); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if qid != "ORIGINAL_MSG_ID" {
+		t.Errorf("quoted_message_id = %q, want ORIGINAL_MSG_ID -- a reply cannot be resolved to its target", qid)
+	}
+	if qsender != "919999999999@s.whatsapp.net" {
+		t.Errorf("quoted_sender = %q", qsender)
+	}
+	if qcontent != "Task proposals B71" {
+		t.Errorf("quoted_content = %q", qcontent)
 	}
 }

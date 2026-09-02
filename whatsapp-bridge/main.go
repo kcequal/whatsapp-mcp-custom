@@ -119,6 +119,9 @@ func NewMessageStore() (*MessageStore, error) {
 			file_sha256 BLOB,
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
+			quoted_message_id TEXT,
+			quoted_sender TEXT,
+			quoted_content TEXT,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -195,6 +198,20 @@ func NewMessageStore() (*MessageStore, error) {
 		!strings.Contains(alterErr.Error(), "duplicate column name") {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to add sender_lid column: %v", alterErr)
+	}
+
+	// Migration: reply context, added 2026-09-02. extractQuotedMessageInfo has
+	// ALWAYS extracted these three (main.go, and they already ride the webhook)
+	// -- StoreMessage simply never persisted them, so anything polling this
+	// store could not see what a reply referred to. Same pattern as sender_lid
+	// above: CREATE TABLE IF NOT EXISTS will not add a column to an existing
+	// database, so it has to happen here.
+	for _, col := range []string{"quoted_message_id", "quoted_sender", "quoted_content"} {
+		if _, alterErr := db.Exec(`ALTER TABLE messages ADD COLUMN ` + col + ` TEXT`); alterErr != nil &&
+			!strings.Contains(alterErr.Error(), "duplicate column name") {
+			_ = db.Close()
+			return nil, fmt.Errorf("failed to add %s column: %v", col, alterErr)
+		}
 	}
 
 	return store, nil
@@ -770,7 +787,8 @@ func (store *MessageStore) TouchChat(jid string, lastMessageTime time.Time) erro
 // LID alias, kept because some contacts only ever appear as a LID. See
 // normalizeSender for how the pair is derived.
 func (store *MessageStore) StoreMessage(id, chatJID, sender, senderLID, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
+	quotedMessageID, quotedSender, quotedContent string) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
@@ -813,15 +831,18 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, senderLID, content 
 
 	if _, err := tx.Exec(
 		`INSERT INTO messages
-		(id, chat_jid, sender, sender_lid, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(id, chat_jid, sender, sender_lid, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message_id, quoted_sender, quoted_content)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id, chat_jid) DO UPDATE SET
 			sender=excluded.sender, sender_lid=excluded.sender_lid, content=excluded.content,
 			timestamp=excluded.timestamp, is_from_me=excluded.is_from_me, media_type=excluded.media_type,
 			filename=excluded.filename, url=excluded.url, media_key=excluded.media_key,
 			file_sha256=excluded.file_sha256, file_enc_sha256=excluded.file_enc_sha256,
-			file_length=excluded.file_length`,
+			file_length=excluded.file_length,
+			quoted_message_id=excluded.quoted_message_id, quoted_sender=excluded.quoted_sender,
+			quoted_content=excluded.quoted_content`,
 		id, chatJID, sender, senderLID, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		quotedMessageID, quotedSender, quotedContent,
 	); err != nil {
 		return err
 	}
@@ -1639,6 +1660,7 @@ func recordOutgoing(client *whatsmeow.Client, messageStore *MessageStore, chat t
 	if err := messageStore.StoreMessage(
 		resp.ID, chatJID, sender, senderLID, content, resp.Timestamp, true,
 		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		"", "", "", // own outgoing send: no inbound quote to record
 	); err != nil {
 		fmt.Printf("Warning: failed to record outgoing message %s in %s: %v\n", resp.ID, chatJID, err)
 		return
@@ -1731,6 +1753,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		quotedMessageId,
+		quotedSender,
+		quotedContent,
 	)
 
 	// Download every piece of media that arrives, unconditionally.
@@ -3460,6 +3485,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					// History sync does not extract quoted context. Left empty
+					// deliberately rather than guessed -- a wrong reply target is
+					// worse than an absent one.
+					"", "", "",
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
