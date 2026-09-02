@@ -1023,6 +1023,22 @@ func extractMentions(text string) []string {
 	return out
 }
 
+// newTextMessage builds an outgoing text message, choosing the wire shape that
+// preserves @-tags. Plain Conversation has NO field for mentions, so any path
+// that hardcodes it silently strips them: that is exactly how /api/edit turned
+// a tagged message back into the literal text "@147609603813461". Mentions
+// render only when the JID is in ContextInfo.MentionedJid, so text carrying
+// @<lid> has to go as an ExtendedTextMessage.
+func newTextMessage(text string) *waProto.Message {
+	if mentions := extractMentions(text); len(mentions) > 0 {
+		return &waProto.Message{ExtendedTextMessage: &waProto.ExtendedTextMessage{
+			Text:        proto.String(text),
+			ContextInfo: &waProto.ContextInfo{MentionedJID: mentions},
+		}}
+	}
+	return &waProto.Message{Conversation: proto.String(text)}
+}
+
 // Extract text content from a message
 func extractTextContent(msg *waProto.Message) string {
 	if msg == nil {
@@ -2433,7 +2449,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 		recipientJID, err := parseRecipient(req.Recipient)
 		if err != nil { jsonFail(w, 400, fmt.Sprintf("bad recipient: %v", err)); return }
-		newContent := &waProto.Message{Conversation: proto.String(req.NewMessage)}
+		// Not Conversation: that shape cannot carry mentions, so editing a
+		// tagged message rewrote the tag as literal "@<lid>" text.
+		newContent := newTextMessage(req.NewMessage)
 		editMsg := client.BuildEdit(recipientJID, req.MessageID, newContent)
 		if _, err := client.SendMessage(context.Background(), recipientJID, editMsg); err != nil {
 			jsonFail(w, 500, fmt.Sprintf("edit failed: %v", err)); return
