@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -865,5 +866,118 @@ func TestReplyContextRoundTrips(t *testing.T) {
 	}
 	if qcontent != "Task proposals B71" {
 		t.Errorf("quoted_content = %q", qcontent)
+	}
+}
+
+// TestNewMessageStore_MigratesExistingDatabaseForReplyContext covers the ONLY
+// path that makes reply context work on a box that is already running: the
+// ALTER TABLE migration in NewMessageStore. Every other test in this file
+// builds a fresh table that already has the columns, so none of them can tell
+// whether an existing database ever gets them -- and every real deployment IS
+// an existing database. This is the same trap main_test.go's hand-copied schema
+// sets: passing against a schema that production does not have.
+//
+// Fails against the pre-change tree: no migration runs, so the columns are
+// absent and StoreMessage's INSERT errors with "no column named
+// quoted_message_id".
+func TestNewMessageStore_MigratesExistingDatabaseForReplyContext(t *testing.T) {
+	// NewMessageStore opens a fixed relative path, so give it its own directory.
+	t.Chdir(t.TempDir())
+	if err := os.MkdirAll("store", 0755); err != nil {
+		t.Fatalf("mkdir store: %v", err)
+	}
+
+	// The schema exactly as it stood BEFORE this change: sender_lid present
+	// (that migration already ran on every live box), quoted_* absent.
+	old, err := sql.Open("sqlite3", "file:store/messages.db")
+	if err != nil {
+		t.Fatalf("open pre-change db: %v", err)
+	}
+	if _, err := old.Exec(`
+		CREATE TABLE chats (
+			jid TEXT PRIMARY KEY,
+			name TEXT,
+			last_message_time TIMESTAMP
+		);
+		CREATE TABLE messages (
+			id TEXT,
+			chat_jid TEXT,
+			sender TEXT,
+			sender_lid TEXT,
+			content TEXT,
+			timestamp TIMESTAMP,
+			is_from_me BOOLEAN,
+			media_type TEXT,
+			filename TEXT,
+			url TEXT,
+			media_key BLOB,
+			file_sha256 BLOB,
+			file_enc_sha256 BLOB,
+			file_length INTEGER,
+			PRIMARY KEY (id, chat_jid),
+			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
+		);
+	`); err != nil {
+		t.Fatalf("build pre-change schema: %v", err)
+	}
+	// A row that predates the migration must survive it.
+	if _, err := old.Exec(
+		`INSERT INTO chats (jid, name, last_message_time) VALUES ('120363@g.us','KC <> KR',?)`,
+		time.Now()); err != nil {
+		t.Fatalf("seed chat: %v", err)
+	}
+	if _, err := old.Exec(
+		`INSERT INTO messages (id, chat_jid, sender, sender_lid, content, timestamp, is_from_me)
+		 VALUES ('legacy1','120363@g.us','919060899999','811','sent before the migration',?,0)`,
+		time.Now()); err != nil {
+		t.Fatalf("seed legacy message: %v", err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatalf("close pre-change db: %v", err)
+	}
+
+	ms, err := NewMessageStore()
+	if err != nil {
+		t.Fatalf("NewMessageStore on an existing database: %v", err)
+	}
+	defer func() { _ = ms.db.Close() }()
+
+	// The migration must be what closed the gap, so assert on the live schema
+	// rather than trusting the round trip alone.
+	for _, col := range []string{"quoted_message_id", "quoted_sender", "quoted_content"} {
+		var n int
+		if err := ms.db.QueryRow(
+			`SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = ?`, col).Scan(&n); err != nil {
+			t.Fatalf("pragma_table_info(%s): %v", col, err)
+		}
+		if n != 1 {
+			t.Errorf("column %q missing after migration -- an existing database never gains reply context", col)
+		}
+	}
+
+	// The legacy row must still be there. A migration that rebuilt the table
+	// would pass the column check above and lose every message.
+	var content string
+	if err := ms.db.QueryRow(
+		`SELECT content FROM messages WHERE id = 'legacy1'`).Scan(&content); err != nil {
+		t.Fatalf("pre-migration row lost: %v", err)
+	}
+	if content != "sent before the migration" {
+		t.Errorf("pre-migration row corrupted: content = %q", content)
+	}
+
+	// End to end on the migrated database, which is what the live bridge does.
+	if err := ms.StoreMessage("reply1", "120363@g.us", "919060899999", "811", "no dupe",
+		time.Now(), true, "", "", "", nil, nil, nil, 0,
+		"legacy1", "919999999999@s.whatsapp.net", "Task proposals B71"); err != nil {
+		t.Fatalf("StoreMessage on migrated database: %v", err)
+	}
+	var qid string
+	if err := ms.db.QueryRow(
+		`SELECT quoted_message_id FROM messages WHERE id = 'reply1'`).Scan(&qid); err != nil {
+		t.Fatalf("read back on migrated database: %v", err)
+	}
+	if qid != "legacy1" {
+		t.Errorf("quoted_message_id = %q, want legacy1", qid)
 	}
 }
