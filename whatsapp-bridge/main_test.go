@@ -1084,3 +1084,111 @@ func TestStoreMessage_ReStoreWithContextStillUpdates(t *testing.T) {
 			qid, qsender, qcontent)
 	}
 }
+
+// TestStoreMessage_PreMigrationRowGainsReplyContext covers the state EVERY
+// existing message on a live box is in after the migration: the three quoted
+// columns are NULL, not "". ALTER TABLE ADD COLUMN fills them with NULL, and
+// nothing rewrites them.
+//
+// Adversarial round 2 (glm5.2) found this gap. The two re-store tests both go
+// through StoreMessage, whose Go signature takes `string`, so they can only
+// ever produce "" -- never NULL. A guard that additionally required the OLD row
+// to be non-NULL would pass both of them and still drop the reply target of
+// every reply to a pre-migration message, which is the exact defect the guard
+// exists to prevent, reached from the other side.
+func TestStoreMessage_PreMigrationRowGainsReplyContext(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chat := "120363@g.us"
+	if err := ms.TouchChat(chat, time.Now()); err != nil {
+		t.Fatalf("TouchChat: %v", err)
+	}
+	// Store normally, then NULL the quoted columns: that is exactly what the
+	// ALTER TABLE migration leaves behind on every pre-existing message, and
+	// StoreMessage itself cannot produce it (its signature takes `string`).
+	// Done this way rather than by a direct INSERT because a direct INSERT
+	// bypasses this store's FTS index maintenance and the next write then fails
+	// with "database disk image is malformed" -- an artefact of the test, not of
+	// the migration.
+	if err := ms.StoreMessage("old1", chat, "919060899999", "811", "a message from before the migration",
+		time.Now(), false, "", "", "", nil, nil, nil, 0, "", "", ""); err != nil {
+		t.Fatalf("seed row: %v", err)
+	}
+	if _, err := ms.db.Exec(
+		`UPDATE messages SET quoted_message_id=NULL, quoted_sender=NULL, quoted_content=NULL
+		 WHERE id = 'old1'`); err != nil {
+		t.Fatalf("seed pre-migration NULLs: %v", err)
+	}
+	var isNull bool
+	if err := ms.db.QueryRow(
+		`SELECT quoted_message_id IS NULL FROM messages WHERE id = 'old1'`).Scan(&isNull); err != nil {
+		t.Fatalf("check setup: %v", err)
+	}
+	if !isNull {
+		t.Fatal("test setup failed to produce a NULL quoted_message_id, so this test proves nothing")
+	}
+
+	// A real reply now arrives for that message id (an edit or a re-delivery of
+	// a row that predates the migration).
+	if err := ms.StoreMessage("old1", chat, "919060899999", "811", "a message from before the migration",
+		time.Now(), false, "", "", "", nil, nil, nil, 0,
+		"TASK_42", "919999999999@s.whatsapp.net", "Task proposals B71"); err != nil {
+		t.Fatalf("store with real quote: %v", err)
+	}
+
+	var qid, qsender, qcontent string
+	if err := ms.db.QueryRow(
+		`SELECT quoted_message_id, quoted_sender, quoted_content FROM messages WHERE id = 'old1'`).
+		Scan(&qid, &qsender, &qcontent); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if qid != "TASK_42" {
+		t.Errorf("quoted_message_id = %q, want TASK_42 -- a real reply target was dropped because the "+
+			"row predated the migration, so taskcap cannot resolve replies to any old message", qid)
+	}
+	if qsender != "919999999999@s.whatsapp.net" || qcontent != "Task proposals B71" {
+		t.Errorf("got sender %q content %q, want the incoming values", qsender, qcontent)
+	}
+}
+
+// TestStoreMessage_ReplyContextIsUpdatedAsOneUnit pins the DESIGN CHOICE in the
+// conflict clause: all three columns key on the incoming quoted_message_id, so
+// the trio can never be assembled from two different messages. Per-column
+// COALESCE would satisfy every other test here and still produce a row whose
+// quoted_sender and quoted_content describe one message while its
+// quoted_message_id names another -- which reads as a confident, wrong answer
+// rather than a missing one.
+//
+// Round 2 flagged that the rationale was stated in the commit and tested
+// nowhere.
+func TestStoreMessage_ReplyContextIsUpdatedAsOneUnit(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chat := "120363@g.us"
+	if err := ms.TouchChat(chat, time.Now()); err != nil {
+		t.Fatalf("TouchChat: %v", err)
+	}
+	if err := ms.StoreMessage("reply1", chat, "919060899999", "811", "no dupe",
+		time.Now(), false, "", "", "", nil, nil, nil, 0,
+		"FIRST_ID", "first@s.whatsapp.net", "first quote"); err != nil {
+		t.Fatalf("first store: %v", err)
+	}
+	// A partial re-store: no id, but a sender and content. Nothing in the bridge
+	// should produce this today, but the clause must not be the thing that
+	// depends on that.
+	if err := ms.StoreMessage("reply1", chat, "919060899999", "811", "no dupe",
+		time.Now(), false, "", "", "", nil, nil, nil, 0,
+		"", "second@s.whatsapp.net", "second quote"); err != nil {
+		t.Fatalf("partial re-store: %v", err)
+	}
+
+	var qid, qsender, qcontent string
+	if err := ms.db.QueryRow(
+		`SELECT quoted_message_id, quoted_sender, quoted_content FROM messages WHERE id = 'reply1'`).
+		Scan(&qid, &qsender, &qcontent); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if qid != "FIRST_ID" || qsender != "first@s.whatsapp.net" || qcontent != "first quote" {
+		t.Errorf("got (%q,%q,%q), want all three from FIRST_ID -- the trio was assembled from two "+
+			"different messages, so the stored quote describes a message it does not name",
+			qid, qsender, qcontent)
+	}
+}
