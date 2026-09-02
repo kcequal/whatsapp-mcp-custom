@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -69,6 +70,9 @@ func newTestMessageStore(t *testing.T) *MessageStore {
 			file_sha256 BLOB,
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
+			quoted_message_id TEXT,
+			quoted_sender TEXT,
+			quoted_content TEXT,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -509,11 +513,11 @@ func TestStoreMessage_SearchIndexSurvivesRestore(t *testing.T) {
 		t.Fatalf("TouchChat: %v", err)
 	}
 	if err := ms.StoreMessage("m1", chat, "919060899999", "811", "vendor update coralogix",
-		time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+		time.Now(), false, "", "", "", nil, nil, nil, 0, "", "", ""); err != nil {
 		t.Fatalf("first store: %v", err)
 	}
 	if err := ms.StoreMessage("m1", chat, "919060899999", "811", "vendor update inworld",
-		time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+		time.Now(), false, "", "", "", nil, nil, nil, 0, "", "", ""); err != nil {
 		t.Fatalf("re-store: %v", err)
 	}
 
@@ -599,7 +603,7 @@ func TestNormalizeExistingSenders_Idempotent(t *testing.T) {
 		t.Fatalf("TouchChat: %v", err)
 	}
 	if err := ms.StoreMessage("m1", chat, "185366493536339", "", "hello",
-		time.Now(), false, "", "", "", nil, nil, nil, 0); err != nil {
+		time.Now(), false, "", "", "", nil, nil, nil, 0, "", "", ""); err != nil {
 		t.Fatalf("store: %v", err)
 	}
 
@@ -829,5 +833,362 @@ func TestCanonicalSender_ExplicitSuffixBeatsInference(t *testing.T) {
 		map[string]string{value: "911111111111"}, map[string]string{value: "222222222222"})
 	if gotS != "911111111111" || gotL != value {
 		t.Errorf("suffixed + ambiguous: got (%q,%q), want (911111111111,%s)", gotS, gotL, value)
+	}
+}
+
+// TestReplyContextRoundTrips proves the defect this change closes: the bridge
+// has always EXTRACTED quoted message id/sender/content and sent them over the
+// webhook, but StoreMessage never persisted them -- so anything polling this
+// store (taskcap's reply reader) could not tell what a reply referred to.
+// Fails against the pre-change tree: the columns did not exist.
+func TestReplyContextRoundTrips(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chat := "120363@g.us"
+	if err := ms.TouchChat(chat, time.Now()); err != nil {
+		t.Fatalf("TouchChat: %v", err)
+	}
+	if err := ms.StoreMessage("reply1", chat, "919060899999", "811", "no dupe",
+		time.Now(), true, "", "", "", nil, nil, nil, 0,
+		"ORIGINAL_MSG_ID", "919999999999@s.whatsapp.net", "Task proposals B71"); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	var qid, qsender, qcontent string
+	if err := ms.db.QueryRow(
+		`SELECT quoted_message_id, quoted_sender, quoted_content FROM messages WHERE id = ? AND chat_jid = ?`,
+		"reply1", chat).Scan(&qid, &qsender, &qcontent); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if qid != "ORIGINAL_MSG_ID" {
+		t.Errorf("quoted_message_id = %q, want ORIGINAL_MSG_ID -- a reply cannot be resolved to its target", qid)
+	}
+	if qsender != "919999999999@s.whatsapp.net" {
+		t.Errorf("quoted_sender = %q", qsender)
+	}
+	if qcontent != "Task proposals B71" {
+		t.Errorf("quoted_content = %q", qcontent)
+	}
+}
+
+// TestNewMessageStore_MigratesExistingDatabaseForReplyContext covers the ONLY
+// path that makes reply context work on a box that is already running: the
+// ALTER TABLE migration in NewMessageStore. Every other test in this file
+// builds a fresh table that already has the columns, so none of them can tell
+// whether an existing database ever gets them -- and every real deployment IS
+// an existing database. This is the same trap main_test.go's hand-copied schema
+// sets: passing against a schema that production does not have.
+//
+// Fails against the pre-change tree: no migration runs, so the columns are
+// absent and StoreMessage's INSERT errors with "no column named
+// quoted_message_id".
+func TestNewMessageStore_MigratesExistingDatabaseForReplyContext(t *testing.T) {
+	// NewMessageStore opens a fixed relative path, so give it its own directory.
+	t.Chdir(t.TempDir())
+	if err := os.MkdirAll("store", 0755); err != nil {
+		t.Fatalf("mkdir store: %v", err)
+	}
+
+	// The schema exactly as it stood BEFORE this change: sender_lid present
+	// (that migration already ran on every live box), quoted_* absent.
+	old, err := sql.Open("sqlite3", "file:store/messages.db")
+	if err != nil {
+		t.Fatalf("open pre-change db: %v", err)
+	}
+	if _, err := old.Exec(`
+		CREATE TABLE chats (
+			jid TEXT PRIMARY KEY,
+			name TEXT,
+			last_message_time TIMESTAMP
+		);
+		CREATE TABLE messages (
+			id TEXT,
+			chat_jid TEXT,
+			sender TEXT,
+			sender_lid TEXT,
+			content TEXT,
+			timestamp TIMESTAMP,
+			is_from_me BOOLEAN,
+			media_type TEXT,
+			filename TEXT,
+			url TEXT,
+			media_key BLOB,
+			file_sha256 BLOB,
+			file_enc_sha256 BLOB,
+			file_length INTEGER,
+			PRIMARY KEY (id, chat_jid),
+			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
+		);
+	`); err != nil {
+		t.Fatalf("build pre-change schema: %v", err)
+	}
+	// A live box is NOT a bare schema: it already carries bridge_meta and the
+	// FTS5 external-content index over messages, and NewMessageStore runs
+	// reconcileSearchIndex against both BEFORE reaching the migration. Seeding
+	// them is what makes this the production path rather than a path that only
+	// works because the index was absent.
+	if _, err := old.Exec(`
+		CREATE TABLE bridge_meta (key TEXT PRIMARY KEY, value TEXT);
+		CREATE VIRTUAL TABLE messages_fts USING fts5(
+			content, sender, chat_jid,
+			content='messages',
+			content_rowid='rowid',
+			tokenize='unicode61 remove_diacritics 2'
+		);
+	`); err != nil {
+		t.Fatalf("seed live-box tables: %v", err)
+	}
+
+	// A row that predates the migration must survive it.
+	if _, err := old.Exec(
+		`INSERT INTO chats (jid, name, last_message_time) VALUES ('120363@g.us','KC <> KR',?)`,
+		time.Now()); err != nil {
+		t.Fatalf("seed chat: %v", err)
+	}
+	if _, err := old.Exec(
+		`INSERT INTO messages (id, chat_jid, sender, sender_lid, content, timestamp, is_from_me)
+		 VALUES ('legacy1','120363@g.us','919060899999','811','sent before the migration',?,0)`,
+		time.Now()); err != nil {
+		t.Fatalf("seed legacy message: %v", err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatalf("close pre-change db: %v", err)
+	}
+
+	ms, err := NewMessageStore()
+	if err != nil {
+		t.Fatalf("NewMessageStore on an existing database: %v", err)
+	}
+	defer func() { _ = ms.db.Close() }()
+
+	// The migration must be what closed the gap, so assert on the live schema
+	// rather than trusting the round trip alone.
+	for _, col := range []string{"quoted_message_id", "quoted_sender", "quoted_content"} {
+		var n int
+		if err := ms.db.QueryRow(
+			`SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = ?`, col).Scan(&n); err != nil {
+			t.Fatalf("pragma_table_info(%s): %v", col, err)
+		}
+		if n != 1 {
+			t.Errorf("column %q missing after migration -- an existing database never gains reply context", col)
+		}
+	}
+
+	// The legacy row must still be there. A migration that rebuilt the table
+	// would pass the column check above and lose every message.
+	var content string
+	if err := ms.db.QueryRow(
+		`SELECT content FROM messages WHERE id = 'legacy1'`).Scan(&content); err != nil {
+		t.Fatalf("pre-migration row lost: %v", err)
+	}
+	if content != "sent before the migration" {
+		t.Errorf("pre-migration row corrupted: content = %q", content)
+	}
+
+	// End to end on the migrated database, which is what the live bridge does.
+	if err := ms.StoreMessage("reply1", "120363@g.us", "919060899999", "811", "no dupe",
+		time.Now(), true, "", "", "", nil, nil, nil, 0,
+		"legacy1", "919999999999@s.whatsapp.net", "Task proposals B71"); err != nil {
+		t.Fatalf("StoreMessage on migrated database: %v", err)
+	}
+	var qid string
+	if err := ms.db.QueryRow(
+		`SELECT quoted_message_id FROM messages WHERE id = 'reply1'`).Scan(&qid); err != nil {
+		t.Fatalf("read back on migrated database: %v", err)
+	}
+	if qid != "legacy1" {
+		t.Errorf("quoted_message_id = %q, want legacy1", qid)
+	}
+}
+
+// TestStoreMessage_ReStoreDoesNotEraseReplyContext is the defect adversarial
+// round 1 found, reproduced before it was fixed.
+//
+// StoreMessage upserts: ON CONFLICT (id, chat_jid) DO UPDATE. Two of the three
+// call sites pass empty reply context on purpose (own sends have no inbound
+// quote; history sync never extracts one). History sync re-stores messages that
+// are ALREADY in the database -- that is what a history sync is -- so a reply
+// captured live, with its quoted target intact, was overwritten with empty
+// strings the next time WhatsApp replayed that conversation.
+//
+// It matters because taskcap resolves a reply to the task it deletes using
+// exactly these columns. Losing them does not fail loudly; it makes a reply
+// unresolvable, silently and permanently.
+//
+// An absent value must never overwrite a known one.
+func TestStoreMessage_ReStoreDoesNotEraseReplyContext(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chat := "120363@g.us"
+	if err := ms.TouchChat(chat, time.Now()); err != nil {
+		t.Fatalf("TouchChat: %v", err)
+	}
+
+	// Live inbound: the reply arrives with its quoted target.
+	if err := ms.StoreMessage("reply1", chat, "919060899999", "811", "no dupe",
+		time.Now(), false, "", "", "", nil, nil, nil, 0,
+		"ORIGINAL_MSG_ID", "919999999999@s.whatsapp.net", "Task proposals B71"); err != nil {
+		t.Fatalf("live store: %v", err)
+	}
+
+	// History sync replays the same message id with no quoted context.
+	if err := ms.StoreMessage("reply1", chat, "919060899999", "811", "no dupe",
+		time.Now(), false, "", "", "", nil, nil, nil, 0,
+		"", "", ""); err != nil {
+		t.Fatalf("history re-store: %v", err)
+	}
+
+	var qid, qsender, qcontent string
+	if err := ms.db.QueryRow(
+		`SELECT quoted_message_id, quoted_sender, quoted_content FROM messages WHERE id = ? AND chat_jid = ?`,
+		"reply1", chat).Scan(&qid, &qsender, &qcontent); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if qid != "ORIGINAL_MSG_ID" {
+		t.Errorf("quoted_message_id = %q after a re-store with no quoted context, want ORIGINAL_MSG_ID "+
+			"-- history sync erased a reply target that was captured correctly", qid)
+	}
+	if qsender != "919999999999@s.whatsapp.net" {
+		t.Errorf("quoted_sender = %q, want it preserved", qsender)
+	}
+	if qcontent != "Task proposals B71" {
+		t.Errorf("quoted_content = %q, want it preserved", qcontent)
+	}
+}
+
+// The other direction: a re-store that DOES carry reply context must be able to
+// correct a row, otherwise "never overwrite" becomes "never update" and a
+// mis-captured target is frozen in place forever.
+func TestStoreMessage_ReStoreWithContextStillUpdates(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chat := "120363@g.us"
+	if err := ms.TouchChat(chat, time.Now()); err != nil {
+		t.Fatalf("TouchChat: %v", err)
+	}
+	if err := ms.StoreMessage("reply1", chat, "919060899999", "811", "no dupe",
+		time.Now(), false, "", "", "", nil, nil, nil, 0,
+		"WRONG_ID", "wrong@s.whatsapp.net", "wrong"); err != nil {
+		t.Fatalf("first store: %v", err)
+	}
+	if err := ms.StoreMessage("reply1", chat, "919060899999", "811", "no dupe",
+		time.Now(), false, "", "", "", nil, nil, nil, 0,
+		"RIGHT_ID", "right@s.whatsapp.net", "right"); err != nil {
+		t.Fatalf("corrective store: %v", err)
+	}
+
+	var qid, qsender, qcontent string
+	if err := ms.db.QueryRow(
+		`SELECT quoted_message_id, quoted_sender, quoted_content FROM messages WHERE id = ? AND chat_jid = ?`,
+		"reply1", chat).Scan(&qid, &qsender, &qcontent); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if qid != "RIGHT_ID" || qsender != "right@s.whatsapp.net" || qcontent != "right" {
+		t.Errorf("got (%q,%q,%q), want the corrective values -- a real update must still land",
+			qid, qsender, qcontent)
+	}
+}
+
+// TestStoreMessage_PreMigrationRowGainsReplyContext covers the state EVERY
+// existing message on a live box is in after the migration: the three quoted
+// columns are NULL, not "". ALTER TABLE ADD COLUMN fills them with NULL, and
+// nothing rewrites them.
+//
+// Adversarial round 2 (glm5.2) found this gap. The two re-store tests both go
+// through StoreMessage, whose Go signature takes `string`, so they can only
+// ever produce "" -- never NULL. A guard that additionally required the OLD row
+// to be non-NULL would pass both of them and still drop the reply target of
+// every reply to a pre-migration message, which is the exact defect the guard
+// exists to prevent, reached from the other side.
+func TestStoreMessage_PreMigrationRowGainsReplyContext(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chat := "120363@g.us"
+	if err := ms.TouchChat(chat, time.Now()); err != nil {
+		t.Fatalf("TouchChat: %v", err)
+	}
+	// Store normally, then NULL the quoted columns: that is exactly what the
+	// ALTER TABLE migration leaves behind on every pre-existing message, and
+	// StoreMessage itself cannot produce it (its signature takes `string`).
+	// Done this way rather than by a direct INSERT because a direct INSERT
+	// bypasses this store's FTS index maintenance and the next write then fails
+	// with "database disk image is malformed" -- an artefact of the test, not of
+	// the migration.
+	if err := ms.StoreMessage("old1", chat, "919060899999", "811", "a message from before the migration",
+		time.Now(), false, "", "", "", nil, nil, nil, 0, "", "", ""); err != nil {
+		t.Fatalf("seed row: %v", err)
+	}
+	if _, err := ms.db.Exec(
+		`UPDATE messages SET quoted_message_id=NULL, quoted_sender=NULL, quoted_content=NULL
+		 WHERE id = 'old1'`); err != nil {
+		t.Fatalf("seed pre-migration NULLs: %v", err)
+	}
+	var isNull bool
+	if err := ms.db.QueryRow(
+		`SELECT quoted_message_id IS NULL FROM messages WHERE id = 'old1'`).Scan(&isNull); err != nil {
+		t.Fatalf("check setup: %v", err)
+	}
+	if !isNull {
+		t.Fatal("test setup failed to produce a NULL quoted_message_id, so this test proves nothing")
+	}
+
+	// A real reply now arrives for that message id (an edit or a re-delivery of
+	// a row that predates the migration).
+	if err := ms.StoreMessage("old1", chat, "919060899999", "811", "a message from before the migration",
+		time.Now(), false, "", "", "", nil, nil, nil, 0,
+		"TASK_42", "919999999999@s.whatsapp.net", "Task proposals B71"); err != nil {
+		t.Fatalf("store with real quote: %v", err)
+	}
+
+	var qid, qsender, qcontent string
+	if err := ms.db.QueryRow(
+		`SELECT quoted_message_id, quoted_sender, quoted_content FROM messages WHERE id = 'old1'`).
+		Scan(&qid, &qsender, &qcontent); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if qid != "TASK_42" {
+		t.Errorf("quoted_message_id = %q, want TASK_42 -- a real reply target was dropped because the "+
+			"row predated the migration, so taskcap cannot resolve replies to any old message", qid)
+	}
+	if qsender != "919999999999@s.whatsapp.net" || qcontent != "Task proposals B71" {
+		t.Errorf("got sender %q content %q, want the incoming values", qsender, qcontent)
+	}
+}
+
+// TestStoreMessage_ReplyContextIsUpdatedAsOneUnit pins the DESIGN CHOICE in the
+// conflict clause: all three columns key on the incoming quoted_message_id, so
+// the trio can never be assembled from two different messages. Per-column
+// COALESCE would satisfy every other test here and still produce a row whose
+// quoted_sender and quoted_content describe one message while its
+// quoted_message_id names another -- which reads as a confident, wrong answer
+// rather than a missing one.
+//
+// Round 2 flagged that the rationale was stated in the commit and tested
+// nowhere.
+func TestStoreMessage_ReplyContextIsUpdatedAsOneUnit(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chat := "120363@g.us"
+	if err := ms.TouchChat(chat, time.Now()); err != nil {
+		t.Fatalf("TouchChat: %v", err)
+	}
+	if err := ms.StoreMessage("reply1", chat, "919060899999", "811", "no dupe",
+		time.Now(), false, "", "", "", nil, nil, nil, 0,
+		"FIRST_ID", "first@s.whatsapp.net", "first quote"); err != nil {
+		t.Fatalf("first store: %v", err)
+	}
+	// A partial re-store: no id, but a sender and content. Nothing in the bridge
+	// should produce this today, but the clause must not be the thing that
+	// depends on that.
+	if err := ms.StoreMessage("reply1", chat, "919060899999", "811", "no dupe",
+		time.Now(), false, "", "", "", nil, nil, nil, 0,
+		"", "second@s.whatsapp.net", "second quote"); err != nil {
+		t.Fatalf("partial re-store: %v", err)
+	}
+
+	var qid, qsender, qcontent string
+	if err := ms.db.QueryRow(
+		`SELECT quoted_message_id, quoted_sender, quoted_content FROM messages WHERE id = 'reply1'`).
+		Scan(&qid, &qsender, &qcontent); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if qid != "FIRST_ID" || qsender != "first@s.whatsapp.net" || qcontent != "first quote" {
+		t.Errorf("got (%q,%q,%q), want all three from FIRST_ID -- the trio was assembled from two "+
+			"different messages, so the stored quote describes a message it does not name",
+			qid, qsender, qcontent)
 	}
 }

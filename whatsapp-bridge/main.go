@@ -119,6 +119,9 @@ func NewMessageStore() (*MessageStore, error) {
 			file_sha256 BLOB,
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
+			quoted_message_id TEXT,
+			quoted_sender TEXT,
+			quoted_content TEXT,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -195,6 +198,20 @@ func NewMessageStore() (*MessageStore, error) {
 		!strings.Contains(alterErr.Error(), "duplicate column name") {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to add sender_lid column: %v", alterErr)
+	}
+
+	// Migration: reply context, added 2026-09-02. extractQuotedMessageInfo has
+	// ALWAYS extracted these three (main.go, and they already ride the webhook)
+	// -- StoreMessage simply never persisted them, so anything polling this
+	// store could not see what a reply referred to. Same pattern as sender_lid
+	// above: CREATE TABLE IF NOT EXISTS will not add a column to an existing
+	// database, so it has to happen here.
+	for _, col := range []string{"quoted_message_id", "quoted_sender", "quoted_content"} {
+		if _, alterErr := db.Exec(`ALTER TABLE messages ADD COLUMN ` + col + ` TEXT`); alterErr != nil &&
+			!strings.Contains(alterErr.Error(), "duplicate column name") {
+			_ = db.Close()
+			return nil, fmt.Errorf("failed to add %s column: %v", col, alterErr)
+		}
 	}
 
 	return store, nil
@@ -770,7 +787,8 @@ func (store *MessageStore) TouchChat(jid string, lastMessageTime time.Time) erro
 // LID alias, kept because some contacts only ever appear as a LID. See
 // normalizeSender for how the pair is derived.
 func (store *MessageStore) StoreMessage(id, chatJID, sender, senderLID, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
+	quotedMessageID, quotedSender, quotedContent string) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
@@ -813,15 +831,30 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, senderLID, content 
 
 	if _, err := tx.Exec(
 		`INSERT INTO messages
-		(id, chat_jid, sender, sender_lid, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(id, chat_jid, sender, sender_lid, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message_id, quoted_sender, quoted_content)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id, chat_jid) DO UPDATE SET
 			sender=excluded.sender, sender_lid=excluded.sender_lid, content=excluded.content,
 			timestamp=excluded.timestamp, is_from_me=excluded.is_from_me, media_type=excluded.media_type,
 			filename=excluded.filename, url=excluded.url, media_key=excluded.media_key,
 			file_sha256=excluded.file_sha256, file_enc_sha256=excluded.file_enc_sha256,
-			file_length=excluded.file_length`,
+			file_length=excluded.file_length,
+			-- An ABSENT reply target must never overwrite a known one. Two of the
+			-- three call sites pass empty reply context by design (own sends have
+			-- no inbound quote; history sync never extracts one), and history sync
+			-- re-stores messages that are already here -- so a plain upsert erased
+			-- the quoted target of every reply WhatsApp later replayed. taskcap
+			-- resolves a reply to the task it DELETES through these columns, and
+			-- the loss is silent. Keyed on quoted_message_id for all three so the
+			-- trio can never come from two different messages.
+			quoted_message_id=CASE WHEN excluded.quoted_message_id != ''
+				THEN excluded.quoted_message_id ELSE messages.quoted_message_id END,
+			quoted_sender=CASE WHEN excluded.quoted_message_id != ''
+				THEN excluded.quoted_sender ELSE messages.quoted_sender END,
+			quoted_content=CASE WHEN excluded.quoted_message_id != ''
+				THEN excluded.quoted_content ELSE messages.quoted_content END`,
 		id, chatJID, sender, senderLID, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		quotedMessageID, quotedSender, quotedContent,
 	); err != nil {
 		return err
 	}
@@ -1000,6 +1033,22 @@ func extractMentions(text string) []string {
 		}
 	}
 	return out
+}
+
+// newTextMessage builds an outgoing text message, choosing the wire shape that
+// preserves @-tags. Plain Conversation has NO field for mentions, so any path
+// that hardcodes it silently strips them: that is exactly how /api/edit turned
+// a tagged message back into the literal text "@147609603813461". Mentions
+// render only when the JID is in ContextInfo.MentionedJid, so text carrying
+// @<lid> has to go as an ExtendedTextMessage.
+func newTextMessage(text string) *waProto.Message {
+	if mentions := extractMentions(text); len(mentions) > 0 {
+		return &waProto.Message{ExtendedTextMessage: &waProto.ExtendedTextMessage{
+			Text:        proto.String(text),
+			ContextInfo: &waProto.ContextInfo{MentionedJID: mentions},
+		}}
+	}
+	return &waProto.Message{Conversation: proto.String(text)}
 }
 
 // Extract text content from a message
@@ -1639,6 +1688,7 @@ func recordOutgoing(client *whatsmeow.Client, messageStore *MessageStore, chat t
 	if err := messageStore.StoreMessage(
 		resp.ID, chatJID, sender, senderLID, content, resp.Timestamp, true,
 		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		"", "", "", // own outgoing send: no inbound quote to record
 	); err != nil {
 		fmt.Printf("Warning: failed to record outgoing message %s in %s: %v\n", resp.ID, chatJID, err)
 		return
@@ -1731,6 +1781,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		quotedMessageId,
+		quotedSender,
+		quotedContent,
 	)
 
 	// Download every piece of media that arrives, unconditionally.
@@ -2408,7 +2461,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 		recipientJID, err := parseRecipient(req.Recipient)
 		if err != nil { jsonFail(w, 400, fmt.Sprintf("bad recipient: %v", err)); return }
-		newContent := &waProto.Message{Conversation: proto.String(req.NewMessage)}
+		// Not Conversation: that shape cannot carry mentions, so editing a
+		// tagged message rewrote the tag as literal "@<lid>" text.
+		newContent := newTextMessage(req.NewMessage)
 		editMsg := client.BuildEdit(recipientJID, req.MessageID, newContent)
 		if _, err := client.SendMessage(context.Background(), recipientJID, editMsg); err != nil {
 			jsonFail(w, 500, fmt.Sprintf("edit failed: %v", err)); return
@@ -3460,6 +3515,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					// History sync does not extract quoted context. Left empty
+					// deliberately rather than guessed -- a wrong reply target is
+					// worse than an absent one.
+					"", "", "",
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
