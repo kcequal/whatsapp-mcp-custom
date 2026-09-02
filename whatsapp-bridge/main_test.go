@@ -920,6 +920,23 @@ func TestNewMessageStore_MigratesExistingDatabaseForReplyContext(t *testing.T) {
 	`); err != nil {
 		t.Fatalf("build pre-change schema: %v", err)
 	}
+	// A live box is NOT a bare schema: it already carries bridge_meta and the
+	// FTS5 external-content index over messages, and NewMessageStore runs
+	// reconcileSearchIndex against both BEFORE reaching the migration. Seeding
+	// them is what makes this the production path rather than a path that only
+	// works because the index was absent.
+	if _, err := old.Exec(`
+		CREATE TABLE bridge_meta (key TEXT PRIMARY KEY, value TEXT);
+		CREATE VIRTUAL TABLE messages_fts USING fts5(
+			content, sender, chat_jid,
+			content='messages',
+			content_rowid='rowid',
+			tokenize='unicode61 remove_diacritics 2'
+		);
+	`); err != nil {
+		t.Fatalf("seed live-box tables: %v", err)
+	}
+
 	// A row that predates the migration must survive it.
 	if _, err := old.Exec(
 		`INSERT INTO chats (jid, name, last_message_time) VALUES ('120363@g.us','KC <> KR',?)`,
@@ -979,5 +996,91 @@ func TestNewMessageStore_MigratesExistingDatabaseForReplyContext(t *testing.T) {
 	}
 	if qid != "legacy1" {
 		t.Errorf("quoted_message_id = %q, want legacy1", qid)
+	}
+}
+
+// TestStoreMessage_ReStoreDoesNotEraseReplyContext is the defect adversarial
+// round 1 found, reproduced before it was fixed.
+//
+// StoreMessage upserts: ON CONFLICT (id, chat_jid) DO UPDATE. Two of the three
+// call sites pass empty reply context on purpose (own sends have no inbound
+// quote; history sync never extracts one). History sync re-stores messages that
+// are ALREADY in the database -- that is what a history sync is -- so a reply
+// captured live, with its quoted target intact, was overwritten with empty
+// strings the next time WhatsApp replayed that conversation.
+//
+// It matters because taskcap resolves a reply to the task it deletes using
+// exactly these columns. Losing them does not fail loudly; it makes a reply
+// unresolvable, silently and permanently.
+//
+// An absent value must never overwrite a known one.
+func TestStoreMessage_ReStoreDoesNotEraseReplyContext(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chat := "120363@g.us"
+	if err := ms.TouchChat(chat, time.Now()); err != nil {
+		t.Fatalf("TouchChat: %v", err)
+	}
+
+	// Live inbound: the reply arrives with its quoted target.
+	if err := ms.StoreMessage("reply1", chat, "919060899999", "811", "no dupe",
+		time.Now(), false, "", "", "", nil, nil, nil, 0,
+		"ORIGINAL_MSG_ID", "919999999999@s.whatsapp.net", "Task proposals B71"); err != nil {
+		t.Fatalf("live store: %v", err)
+	}
+
+	// History sync replays the same message id with no quoted context.
+	if err := ms.StoreMessage("reply1", chat, "919060899999", "811", "no dupe",
+		time.Now(), false, "", "", "", nil, nil, nil, 0,
+		"", "", ""); err != nil {
+		t.Fatalf("history re-store: %v", err)
+	}
+
+	var qid, qsender, qcontent string
+	if err := ms.db.QueryRow(
+		`SELECT quoted_message_id, quoted_sender, quoted_content FROM messages WHERE id = ? AND chat_jid = ?`,
+		"reply1", chat).Scan(&qid, &qsender, &qcontent); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if qid != "ORIGINAL_MSG_ID" {
+		t.Errorf("quoted_message_id = %q after a re-store with no quoted context, want ORIGINAL_MSG_ID "+
+			"-- history sync erased a reply target that was captured correctly", qid)
+	}
+	if qsender != "919999999999@s.whatsapp.net" {
+		t.Errorf("quoted_sender = %q, want it preserved", qsender)
+	}
+	if qcontent != "Task proposals B71" {
+		t.Errorf("quoted_content = %q, want it preserved", qcontent)
+	}
+}
+
+// The other direction: a re-store that DOES carry reply context must be able to
+// correct a row, otherwise "never overwrite" becomes "never update" and a
+// mis-captured target is frozen in place forever.
+func TestStoreMessage_ReStoreWithContextStillUpdates(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chat := "120363@g.us"
+	if err := ms.TouchChat(chat, time.Now()); err != nil {
+		t.Fatalf("TouchChat: %v", err)
+	}
+	if err := ms.StoreMessage("reply1", chat, "919060899999", "811", "no dupe",
+		time.Now(), false, "", "", "", nil, nil, nil, 0,
+		"WRONG_ID", "wrong@s.whatsapp.net", "wrong"); err != nil {
+		t.Fatalf("first store: %v", err)
+	}
+	if err := ms.StoreMessage("reply1", chat, "919060899999", "811", "no dupe",
+		time.Now(), false, "", "", "", nil, nil, nil, 0,
+		"RIGHT_ID", "right@s.whatsapp.net", "right"); err != nil {
+		t.Fatalf("corrective store: %v", err)
+	}
+
+	var qid, qsender, qcontent string
+	if err := ms.db.QueryRow(
+		`SELECT quoted_message_id, quoted_sender, quoted_content FROM messages WHERE id = ? AND chat_jid = ?`,
+		"reply1", chat).Scan(&qid, &qsender, &qcontent); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if qid != "RIGHT_ID" || qsender != "right@s.whatsapp.net" || qcontent != "right" {
+		t.Errorf("got (%q,%q,%q), want the corrective values -- a real update must still land",
+			qid, qsender, qcontent)
 	}
 }

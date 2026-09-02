@@ -839,8 +839,20 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, senderLID, content 
 			filename=excluded.filename, url=excluded.url, media_key=excluded.media_key,
 			file_sha256=excluded.file_sha256, file_enc_sha256=excluded.file_enc_sha256,
 			file_length=excluded.file_length,
-			quoted_message_id=excluded.quoted_message_id, quoted_sender=excluded.quoted_sender,
-			quoted_content=excluded.quoted_content`,
+			-- An ABSENT reply target must never overwrite a known one. Two of the
+			-- three call sites pass empty reply context by design (own sends have
+			-- no inbound quote; history sync never extracts one), and history sync
+			-- re-stores messages that are already here -- so a plain upsert erased
+			-- the quoted target of every reply WhatsApp later replayed. taskcap
+			-- resolves a reply to the task it DELETES through these columns, and
+			-- the loss is silent. Keyed on quoted_message_id for all three so the
+			-- trio can never come from two different messages.
+			quoted_message_id=CASE WHEN excluded.quoted_message_id != ''
+				THEN excluded.quoted_message_id ELSE messages.quoted_message_id END,
+			quoted_sender=CASE WHEN excluded.quoted_message_id != ''
+				THEN excluded.quoted_sender ELSE messages.quoted_sender END,
+			quoted_content=CASE WHEN excluded.quoted_message_id != ''
+				THEN excluded.quoted_content ELSE messages.quoted_content END`,
 		id, chatJID, sender, senderLID, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 		quotedMessageID, quotedSender, quotedContent,
 	); err != nil {
