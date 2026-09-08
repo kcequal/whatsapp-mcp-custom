@@ -41,7 +41,7 @@ A Model Context Protocol (MCP) server for WhatsApp, enabling Claude to read and 
 
    ```bash
    cd whatsapp-bridge
-   go run main.go
+   go run .
    ```
 
    Scan the QR code with WhatsApp on your phone to authenticate.
@@ -389,7 +389,7 @@ Windows requires CGO for go-sqlite3. Install [MSYS2](https://www.msys2.org/) and
 
 ```bash
 go env -w CGO_ENABLED=1
-go run main.go
+go run .
 ```
 
 ## Security Notice
@@ -427,3 +427,15 @@ We're grateful to Luke for creating the original project!
 - [MCP Specification](https://modelcontextprotocol.io/)
 - [whatsmeow](https://github.com/tulir/whatsmeow) - WhatsApp Web API library for Go
 - [FastMCP](https://github.com/jlowin/fastmcp) - Fast Model Context Protocol implementation
+
+### Account guard for automatic recovery
+
+Set `WA_RECOVERY_EXPECTED_PHONE` to this bridge's assistant phone (8–15 digits,
+no leading zero, spaces or `+`) when installing automatic recovery. Empty/unset
+preserves existing behavior. Invalid values terminate startup before connecting.
+A missing or different linked phone blocks every HTTP endpoint with HTTP 503,
+`connected: false`, `success: false` and `status: "account_blocked"`. Application
+message/history/call events are ignored before they reach the message database or
+webhook. The guard does not delete the linked account or initiate another pairing;
+an operator must correct a wrong scan. It does not stop WhatsApp's internal protocol
+traffic. Build/run the complete Go package (`go build .` / `go run .`).
