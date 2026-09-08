@@ -1184,6 +1184,7 @@ func sendHandler(send sendFunc) http.HandlerFunc {
 // human message: callers persist it, and parsing it back out of prose is how
 // ledgers start lying.
 func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string, string) {
+	if err := recoveryAccountError(client); err != nil { return false, err.Error(), "" }
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp", ""
 	}
@@ -2116,13 +2117,16 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func bridgeRESTHandler(client *whatsmeow.Client, messageStore *MessageStore) http.Handler {
+	mux := http.NewServeMux()
 	// Health check endpoint
-	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		status := map[string]interface{}{
 			"status":    "ok",
 			"connected": client.IsConnected(),
+			"account_guard_enabled": os.Getenv("WA_RECOVERY_EXPECTED_PHONE") != "",
+			"account_blocked": false,
 			"timestamp": time.Now().Unix(),
 		}
 		if !client.IsConnected() {
@@ -2133,14 +2137,14 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for sending messages
-	http.HandleFunc("/api/send", sendHandler(
+	mux.HandleFunc("/api/send", sendHandler(
 		func(recipient, message, mediaPath string) (bool, string, string) {
 			return sendWhatsAppMessage(client, messageStore, recipient, message, mediaPath)
 		},
 	))
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -2205,7 +2209,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for sending typing indicator
-	http.HandleFunc("/api/typing", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/typing", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -2309,7 +2313,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	// chat. Uses whatsmeow's BuildHistorySyncRequest + a peer-message to
 	// ownID. Response arrives async as *events.HistorySync and lands in the
 	// local DB via the existing handleHistorySync path.
-	http.HandleFunc("/api/history_sync", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/history_sync", func(w http.ResponseWriter, r *http.Request) {
 		if !requirePost(w, r) { return }
 		var req struct {
 			ChatJID string `json:"chat_jid"`
@@ -2367,7 +2371,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	http.HandleFunc("/api/reply", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/reply", func(w http.ResponseWriter, r *http.Request) {
 		if !requirePost(w, r) { return }
 		var req struct {
 			Recipient        string `json:"recipient"`
@@ -2410,7 +2414,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// /api/forward — forward an existing text message to another chat
 	// (For media, use download_media + send_file from the MCP side.)
-	http.HandleFunc("/api/forward", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/forward", func(w http.ResponseWriter, r *http.Request) {
 		if !requirePost(w, r) { return }
 		var req struct {
 			Recipient      string `json:"recipient"`
@@ -2448,7 +2452,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// /api/edit — edit a previously-sent message (15-min window)
-	http.HandleFunc("/api/edit", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/edit", func(w http.ResponseWriter, r *http.Request) {
 		if !requirePost(w, r) { return }
 		var req struct {
 			Recipient  string `json:"recipient"`
@@ -2472,7 +2476,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// /api/revoke — delete a message for everyone (~2-day window)
-	http.HandleFunc("/api/revoke", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/revoke", func(w http.ResponseWriter, r *http.Request) {
 		if !requirePost(w, r) { return }
 		var req struct {
 			Recipient string `json:"recipient"`
@@ -2500,7 +2504,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// /api/read — send read (or delivered) receipt for one or more messages in a chat
-	http.HandleFunc("/api/read", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/read", func(w http.ResponseWriter, r *http.Request) {
 		if !requirePost(w, r) { return }
 		var req struct {
 			ChatJID     string   `json:"chat_jid"`
@@ -2535,7 +2539,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// /api/chat_read — mark all unread messages in a chat as read (batch helper)
-	http.HandleFunc("/api/chat_read", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/chat_read", func(w http.ResponseWriter, r *http.Request) {
 		if !requirePost(w, r) { return }
 		var req struct { ChatJID string `json:"chat_jid"` }
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil { jsonFail(w, 400, "invalid request"); return }
@@ -2568,7 +2572,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// /api/group/info — get metadata and participants for a group JID
-	http.HandleFunc("/api/group/info", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/group/info", func(w http.ResponseWriter, r *http.Request) {
 		if !requirePost(w, r) { return }
 		var req struct { GroupJID string `json:"group_jid"` }
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil { jsonFail(w, 400, "invalid request"); return }
@@ -2602,7 +2606,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// /api/group/participants — add / remove / promote / demote
-	http.HandleFunc("/api/group/participants", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/group/participants", func(w http.ResponseWriter, r *http.Request) {
 		if !requirePost(w, r) { return }
 		var req struct {
 			GroupJID string   `json:"group_jid"`
@@ -2647,7 +2651,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// /api/location — send a static location share
-	http.HandleFunc("/api/location", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/location", func(w http.ResponseWriter, r *http.Request) {
 		if !requirePost(w, r) { return }
 		var req struct {
 			Recipient string  `json:"recipient"`
@@ -2673,7 +2677,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// /api/sticker — send a .webp sticker
-	http.HandleFunc("/api/sticker", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/sticker", func(w http.ResponseWriter, r *http.Request) {
 		if !requirePost(w, r) { return }
 		var req struct {
 			Recipient   string `json:"recipient"`
@@ -2706,7 +2710,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// /api/calls/recent — list recent incoming-call events from the local DB
-	http.HandleFunc("/api/calls/recent", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/calls/recent", func(w http.ResponseWriter, r *http.Request) {
 		if !requirePost(w, r) { return }
 		var req struct {
 			Limit int    `json:"limit"`
@@ -2751,7 +2755,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for sending an emoji reaction to an existing message
-	http.HandleFunc("/api/react", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/react", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -2819,6 +2823,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	return recoveryAccountHTTP(client, mux)
+}
+
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
 	// Start the server with proper timeouts
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -2826,6 +2834,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	// Create server with timeouts for stability
 	server := &http.Server{
 		Addr:         serverAddr,
+		Handler: bridgeRESTHandler(client, messageStore),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second, // Longer for media downloads
 		IdleTimeout:  120 * time.Second,
@@ -2840,6 +2849,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 }
 
 func main() {
+	if err := validateRecoveryPhone(os.Getenv("WA_RECOVERY_EXPECTED_PHONE")); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	// Set up logger with DEBUG level for more detailed logging
 	logger := waLog.Stdout("Client", "DEBUG", true)
 	logger.Infof("Starting WhatsApp client...")
@@ -2907,7 +2920,7 @@ func main() {
 	reconnectChan := make(chan bool, 1)
 
 	// Setup event handling for messages and history sync
-	client.AddEventHandler(func(evt interface{}) {
+	client.AddEventHandler(recoveryAccountEvents(client, func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
 			// Process regular messages
@@ -2976,7 +2989,7 @@ func main() {
 		case *events.CallReject:
 			logCallEvent(messageStore, v.CallID, v.CallCreator.String(), v.From.String(), "reject", "", false)
 		}
-	})
+	}))
 
 	// Create channel to track connection success
 	connected := make(chan bool, 1)
